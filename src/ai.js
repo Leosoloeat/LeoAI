@@ -1,10 +1,13 @@
 'use strict';
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { LEO_AI_SYSTEM_PROMPT } = require('./prompts/leo-ai-system');
-const { Agent }           = require('./agent');
-const { buildBrainContext } = require('./brain');
-const logger              = require('./logger');
+const { Agent }              = require('./agent');
+const { getSystemPrompt, buildBrainContext } = require('./brain');
+const logger                 = require('./logger');
+
+// Build system prompt from brain files (personality + skills + rules + style + forbidden)
+const SYSTEM_PROMPT = getSystemPrompt();
+console.log(`[AI] System prompt loaded from brain (${SYSTEM_PROMPT.length} chars)`);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -70,8 +73,8 @@ console.log('[OR] Model count:', OPENROUTER_MODELS.length);
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = genAI.getGenerativeModel({
-  model: GEMINI_MODEL,
-  systemInstruction: LEO_AI_SYSTEM_PROMPT,
+  model:             GEMINI_MODEL,
+  systemInstruction: SYSTEM_PROMPT,
 });
 
 // ── Error classification ──────────────────────────────────────────────────────
@@ -217,7 +220,7 @@ function getOrAgent(model) {
   const agent = new Agent({
     apiKey,
     model,
-    systemPrompt: LEO_AI_SYSTEM_PROMPT,
+    systemPrompt: SYSTEM_PROMPT,
     siteUrl:      'https://leoai-production.up.railway.app',
     siteName:     'Leo AI LINE OA',
   });

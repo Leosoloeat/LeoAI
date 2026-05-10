@@ -16,7 +16,7 @@ const {
   GEMINI_MODEL,
   OPENROUTER_MODELS,
 } = require('./src/ai');
-const { loadBrain, appendMemory, updateTasks } = require('./src/brain');
+const { loadBrain, reloadBrain, appendMemory, updateTasks } = require('./src/brain');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -146,16 +146,29 @@ async function handleCommand(text, replyToken, userId) {
 
     case '/brain': {
       const b = loadBrain();
+      const section = (label, val) => val ? `${label}:\n${val}` : `${label}: (empty)`;
       const lines = [
-        `Brain System`,
-        ``,
-        `Memory:`,
-        b.memory || '(empty)',
-        ``,
-        `Tasks:`,
-        b.tasks || '(empty)',
+        'Brain System',
+        '',
+        section('Personality', b.personality),
+        '',
+        section('Skills', b.skills),
+        '',
+        section('Rules', b.rules),
+        '',
+        section('Style', b.style),
+        '',
+        section('Forbidden', b.forbidden),
+        '',
+        section('Memory', b.memory),
       ];
       return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/reload': {
+      const b = reloadBrain();
+      const loaded = Object.entries(b).filter(([, v]) => v).map(([k]) => k).join(', ');
+      return safeReply(replyToken, [`Brain reloaded\nFiles: ${loaded}`]);
     }
 
     case '/remember': {
