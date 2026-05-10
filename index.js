@@ -17,6 +17,7 @@ const {
   OPENROUTER_MODELS,
 } = require('./src/ai');
 const { loadBrain, reloadBrain, appendMemory } = require('./src/brain');
+const { loadMemoryFromSheets }                 = require('./src/sheets');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -173,8 +174,29 @@ async function handleCommand(text, replyToken, userId) {
 
     case '/remember': {
       if (!args) return safeReply(replyToken, ['ใส่ข้อความที่จะจำด้วยครับ เช่น /remember ลูกค้าชอบราคาถูก']);
-      appendMemory(`[${userId.slice(-6)}] ${args}`);
-      return safeReply(replyToken, [`จำไว้แล้วครับ: "${args}"`]);
+      appendMemory(`[${userId.slice(-6)}] ${args}`, userId);
+      const sheetsNote = process.env.GOOGLE_SCRIPT_URL ? ' (บันทึก Sheets ด้วย)' : '';
+      return safeReply(replyToken, [`จำไว้แล้วครับ: "${args}"${sheetsNote}`]);
+    }
+
+    case '/memory': {
+      if (!process.env.GOOGLE_SCRIPT_URL) {
+        const b = loadBrain();
+        return safeReply(replyToken, [`Memory (local)\n\n${b.memory || '(ยังไม่มี memory)'}`]);
+      }
+      const { ok, rows, reason } = await loadMemoryFromSheets(15);
+      if (!ok) {
+        return safeReply(replyToken, [`โหลด Sheets ไม่ได้ครับ (${reason})\nลอง /brain เพื่อดู local memory`]);
+      }
+      if (rows.length === 0) {
+        return safeReply(replyToken, ['ยังไม่มี memory ใน Google Sheets ครับ\nใช้ /remember เพื่อเพิ่ม']);
+      }
+      const lines = [
+        `Memory (${rows.length} รายการล่าสุด)`,
+        '',
+        ...rows.map((r) => `• ${String(r.timestamp).slice(0, 16)} — ${r.memory}`),
+      ];
+      return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
     }
 
     default:

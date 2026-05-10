@@ -70,16 +70,22 @@ function buildBrainContext() {
 
 // ── Memory writer ─────────────────────────────────────────────────────────────
 
-function appendMemory(entry) {
+function appendMemory(entry, userId = 'system') {
   const file = path.join(BRAIN_DIR, 'memory.md');
   const ts   = new Date().toISOString().replace('T', ' ').slice(0, 16);
+
+  // 1. Write to local file (always, synchronous)
   try {
     fs.appendFileSync(file, `\n- [${ts}] ${entry}`, 'utf8');
-    _cache = null; // invalidate cache so next request picks up new memory
+    _cache = null;
     console.log(`[brain] Memory updated: "${entry}"`);
   } catch (e) {
     console.warn('[brain] appendMemory failed:', e.message);
   }
+
+  // 2. Fire-and-forget to Google Sheets (never blocks LINE reply)
+  const { saveMemoryToSheets } = require('./sheets');
+  saveMemoryToSheets(userId, entry, '/remember').catch(() => {});
 }
 
 function updateTasks(content) {
