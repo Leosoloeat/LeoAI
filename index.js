@@ -37,6 +37,18 @@ const LINE_MAX_TEXT       = 4_900;
 const MAX_HISTORY_ENTRIES = 20;
 const SESSION_TTL_MS      = 30 * 60_000;
 
+// ── Model aliases for /use command ─────────────────────────────────────────────
+const MODEL_ALIASES = {
+  gemini:   'gemini',
+  claude:   'anthropic/claude-3-haiku',
+  deepseek: 'deepseek/deepseek-chat-v3-0324:free',
+  qwen:     'qwen/qwen3-32b:free',
+  auto:     null,
+};
+
+// ── Per-user model preference (persists for session lifetime) ──────────────────
+const userModelPrefs = new Map(); // userId → model string | null
+
 // ── LINE client ────────────────────────────────────────────────────────────────
 const client = new messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -210,6 +222,35 @@ async function handleCommand(text, replyToken, userId) {
       return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
     }
 
+    case '/use': {
+      const alias = args.trim().toLowerCase();
+      if (!alias) {
+        const current = userModelPrefs.get(userId) || 'auto';
+        const aliasNames = Object.keys(MODEL_ALIASES).join(' | ');
+        return safeReply(replyToken, [
+          `Model ปัจจุบัน: ${current}`,
+          ``,
+          `เปลี่ยนได้: /use ${aliasNames}`,
+        ].join('\n'));
+      }
+      if (!(alias in MODEL_ALIASES)) {
+        const aliasNames = Object.keys(MODEL_ALIASES).join(', ');
+        return safeReply(replyToken, [`ไม่รู้จัก model "${alias}" ครับ\nใช้ได้: ${aliasNames}`]);
+      }
+      const modelId = MODEL_ALIASES[alias];
+      if (modelId === null) {
+        userModelPrefs.delete(userId);
+        return safeReply(replyToken, [`Auto mode — ระบบเลือก model ให้อัตโนมัติครับ`]);
+      }
+      userModelPrefs.set(userId, modelId);
+      return safeReply(replyToken, [
+        `สลับไปใช้ ${alias} แล้วครับ`,
+        `Model: ${modelId}`,
+        ``,
+        `ใช้ /use auto เพื่อกลับสู่ auto mode`,
+      ].join('\n'));
+    }
+
     default:
       return null; // unknown command — let AI handle it
   }
@@ -255,9 +296,10 @@ async function handleEvent(event) {
   session.lastActive = Date.now();
 
   let responseSent = false;
+  const forceModel = userModelPrefs.get(userId) || null;
 
   try {
-    const { text: raw } = await generateReply(session.history, msgText, userId);
+    const { text: raw } = await generateReply(session.history, msgText, userId, forceModel);
 
     if (!raw || typeof raw !== 'string' || !raw.trim()) {
       if (!responseSent) {

@@ -294,6 +294,27 @@ async function callOpenRouter(history, userText, userId) {
   throw lastErr || new Error('All OpenRouter candidates exhausted');
 }
 
+// ── Force a single specific OR model (ignores cooldown — user chose it) ────────
+
+async function callSingleOrModel(history, userText, userId, model) {
+  if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
+
+  const orHistory = history.map((h) => ({
+    role:    h.role === 'model' ? 'assistant' : 'user',
+    content: h.parts[0]?.text || '',
+  }));
+
+  console.log(`[OR] Force model: ${model}`);
+  const agent = getOrAgent(model);
+  const text  = await agent.chat(orHistory, userText, userId);
+  if (!text?.trim()) throw new Error(`${model} returned empty response`);
+
+  recordWin(model);
+  clearCooldown(model);
+  console.log(`[OR] Force success: ${model} (${text.length} chars)`);
+  return { text, model };
+}
+
 // ── System status (for /debug and /health commands) ───────────────────────────
 
 function getSystemStatus() {
@@ -328,7 +349,7 @@ let _orExhaustedUntil = 0;
 
 // ── Main: Gemini → OpenRouter chain → static fallback ─────────────────────────
 
-async function generateReply(history, userText, userId) {
+async function generateReply(history, userText, userId, forceModel = null) {
   const start    = Date.now();
   const tokenEst = Math.ceil((userText.length + 50) / 4);
 
@@ -341,6 +362,40 @@ async function generateReply(history, userText, userId) {
     : [];
 
   const fullHistory = [...brainHistory, ...history];
+
+  // ── FORCED GEMINI ────────────────────────────────────────────────────────────
+  if (forceModel === 'gemini') {
+    console.log('[AI] Forced: Gemini');
+    try {
+      const result = await callGeminiWithRetry(fullHistory, userText, userId);
+      if (!result?.text?.trim()) throw new Error('empty');
+      logger.info('Reply OK (forced gemini)', { userId, latencyMs: Date.now() - start });
+      return result;
+    } catch (err) {
+      logger.warn('Forced Gemini failed', { userId, err: err.message });
+      return {
+        text: `Gemini ตอบไม่ได้ตอนนี้ครับ (${classifyError(err)})\nใช้ /use auto แล้วลองใหม่ได้เลยครับ`,
+        model: 'gemini-error',
+      };
+    }
+  }
+
+  // ── FORCED OPENROUTER MODEL ──────────────────────────────────────────────────
+  if (forceModel && forceModel !== 'auto') {
+    console.log(`[AI] Forced: ${forceModel}`);
+    try {
+      const result = await callSingleOrModel(fullHistory, userText, userId, forceModel);
+      logger.info('Reply OK (forced OR)', { userId, model: forceModel, latencyMs: Date.now() - start });
+      return result;
+    } catch (err) {
+      const kind = classifyError(err);
+      console.log(`[AI] Forced model failed: ${kind} — falling back to auto`);
+      logger.warn('Forced OR failed — auto routing', { userId, model: forceModel, kind });
+      // Fall through to auto routing
+    }
+  }
+
+  // ── AUTO ROUTING ─────────────────────────────────────────────────────────────
 
   // 1. Gemini (primary) — return immediately on success
   console.log('[AI] Using Gemini');
@@ -366,7 +421,7 @@ async function generateReply(history, userText, userId) {
       try {
         const result = await callOpenRouter(fullHistory, userText, userId);
         if (!result?.text?.trim()) throw new Error('OpenRouter returned empty text');
-        _orExhaustedUntil = 0; // reset cache on success
+        _orExhaustedUntil = 0;
         console.log(`[AI] Generated response (OpenRouter/${result.model}): "${result.text.slice(0, 60)}..."`);
         console.log('[AI] OpenRouter success');
         logger.info('Reply OK via OpenRouter', {
@@ -374,7 +429,7 @@ async function generateReply(history, userText, userId) {
         });
         return result;
       } catch (err) {
-        _orExhaustedUntil = Date.now() + 30_000; // suppress OR for 30s after total failure
+        _orExhaustedUntil = Date.now() + 30_000;
         logger.error('OpenRouter candidates exhausted', { userId, err: err.message });
       }
     }
