@@ -1,4 +1,7 @@
+'use strict';
+
 require('dotenv').config();
+
 const express = require('express');
 const {
   middleware,
@@ -6,37 +9,39 @@ const {
   SignatureValidationFailed,
   JSONParseError,
 } = require('@line/bot-sdk');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { LEO_AI_SYSTEM_PROMPT } = require('./src/prompts/leo-ai-system');
 
-const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const channelSecret = process.env.LINE_CHANNEL_SECRET;
-const geminiKey = process.env.GEMINI_API_KEY;
+const { generateReply, GEMINI_MODEL, OPENROUTER_MODEL } = require('./src/ai');
+const rateLimiter = require('./src/rateLimiter');
+const logger      = require('./src/logger');
 
-if (!channelAccessToken || !channelSecret || !geminiKey) {
-  console.error('Missing env: LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY');
+// ── Startup validation ────────────────────────────────────────────────────────
+const REQUIRED = ['LINE_CHANNEL_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'GEMINI_API_KEY'];
+const missing  = REQUIRED.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error(`[startup] Missing required env vars: ${missing.join(', ')}`);
   process.exit(1);
 }
+if (!process.env.OPENROUTER_API_KEY) {
+  console.warn('[startup] OPENROUTER_API_KEY not set — OpenRouter fallback disabled');
+}
 
-const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const GEMINI_TIMEOUT_MS = 25_000;
-const LINE_MAX_TEXT = 4_900;
+// ── Constants ─────────────────────────────────────────────────────────────────
+const LINE_MAX_TEXT       = 4_900;
 const MAX_HISTORY_ENTRIES = 20;
-const SESSION_TTL_MS = 30 * 60 * 1000;
+const SESSION_TTL_MS      = 30 * 60_000;
 
-const client = new messagingApi.MessagingApiClient({ channelAccessToken });
-const genAI = new GoogleGenerativeAI(geminiKey);
-const model = genAI.getGenerativeModel({
-  model: MODEL_NAME,
-  systemInstruction: LEO_AI_SYSTEM_PROMPT,
+// ── LINE client ───────────────────────────────────────────────────────────────
+const client = new messagingApi.MessagingApiClient({
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// In-memory session store: userId -> { history, lastActive }
-const sessions = new Map();
+// ── In-memory session store ───────────────────────────────────────────────────
+const sessions = new Map(); // userId -> { history, lastActive }
+
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [k, v] of sessions) if (v.lastActive < cutoff) sessions.delete(k);
-}, 5 * 60 * 1000).unref();
+}, 5 * 60_000).unref();
 
 function getSession(userId) {
   let s = sessions.get(userId);
@@ -47,17 +52,20 @@ function getSession(userId) {
   return s;
 }
 
-// LINE doesn't render markdown — strip it defensively in case Gemini ignores the system prompt
+// ── Text helpers ──────────────────────────────────────────────────────────────
+
+// LINE doesn't render markdown — strip it so text reads cleanly
 function stripMarkdown(text) {
   return text
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
+    .replace(/`([^`]+)`/g,  '$1')
     .replace(/^#{1,6}\s+/gm, '')
-    .replace(/^---+$/gm, '')
+    .replace(/^---+$/gm,     '')
     .replace(/^\s*[-*]\s+/gm, '• ');
 }
 
+// Split long responses into ≤4 900-char LINE messages
 function chunkForLine(text) {
   const chunks = [];
   let rest = text.trim();
@@ -72,16 +80,6 @@ function chunkForLine(text) {
   return chunks.length ? chunks : ['ขออภัยครับ ไม่มีข้อความตอบกลับ'];
 }
 
-async function generateWithTimeout(history, userText) {
-  const chat = model.startChat({ history });
-  return Promise.race([
-    chat.sendMessage(userText).then((r) => r.response.text()),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini timeout')), GEMINI_TIMEOUT_MS),
-    ),
-  ]);
-}
-
 async function safeReply(replyToken, texts) {
   try {
     await client.replyMessage({
@@ -89,11 +87,13 @@ async function safeReply(replyToken, texts) {
       messages: texts.slice(0, 5).map((text) => ({ type: 'text', text })),
     });
   } catch (err) {
-    console.error(`[reply] ${err.message}`);
+    logger.error('LINE reply failed', { err: err.message });
   }
 }
 
+// ── Event handler ─────────────────────────────────────────────────────────────
 async function handleEvent(event) {
+  // New follower welcome
   if (event.type === 'follow') {
     return safeReply(event.replyToken, [
       'ขอบคุณที่เพิ่มเป็นเพื่อนครับ Leo Ai พร้อมช่วยเรื่อง LINE OA AI automation และ viral content',
@@ -110,74 +110,105 @@ async function handleEvent(event) {
   }
 
   const userId = event.source?.userId || 'anonymous';
-  const session = getSession(userId);
-  session.lastActive = Date.now();
 
-  let raw;
-  try {
-    raw = await generateWithTimeout(session.history, event.message.text);
-  } catch (err) {
-    console.error(`[gemini] ${err.message}`);
-    const msg = /429|quota/i.test(err.message)
-      ? 'ระบบ AI กำลังใช้งานเยอะครับ ขอลองใหม่อีก 1 นาที'
-      : 'ขออภัยครับ เกิดข้อผิดพลาดชั่วคราว ลองพิมพ์ใหม่อีกครั้งได้เลย';
+  // Rate limiting — prevent spam and double-sends
+  const rate = rateLimiter.check(userId);
+  if (!rate.ok) {
+    const msg = rate.reason === 'pending'
+      ? 'กำลังประมวลผลอยู่ครับ รอแป๊บนึงนะครับ ⏳'
+      : 'ส่งเร็วเกินไปครับ รอแป๊บนึงก่อนนะครับ 😊';
     return safeReply(event.replyToken, [msg]);
   }
 
-  if (!raw || !raw.trim()) {
-    return safeReply(event.replyToken, [
-      'ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ',
-    ]);
+  rateLimiter.start(userId);
+  const session = getSession(userId);
+  session.lastActive = Date.now();
+
+  try {
+    const { text: raw } = await generateReply(
+      session.history,
+      event.message.text,
+      userId,
+    );
+
+    if (!raw?.trim()) {
+      return safeReply(event.replyToken, [
+        'ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ',
+      ]);
+    }
+
+    const cleaned = stripMarkdown(raw);
+
+    // Persist conversation history for context
+    session.history.push(
+      { role: 'user',  parts: [{ text: event.message.text }] },
+      { role: 'model', parts: [{ text: cleaned }] },
+    );
+    if (session.history.length > MAX_HISTORY_ENTRIES) {
+      session.history.splice(0, session.history.length - MAX_HISTORY_ENTRIES);
+    }
+
+    return safeReply(event.replyToken, chunkForLine(cleaned));
+  } finally {
+    rateLimiter.done(userId);
   }
-
-  const cleaned = stripMarkdown(raw);
-
-  session.history.push(
-    { role: 'user', parts: [{ text: event.message.text }] },
-    { role: 'model', parts: [{ text: cleaned }] },
-  );
-  if (session.history.length > MAX_HISTORY_ENTRIES) {
-    session.history.splice(0, session.history.length - MAX_HISTORY_ENTRIES);
-  }
-
-  return safeReply(event.replyToken, chunkForLine(cleaned));
 }
 
+// ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 
+// Railway keep-alive ping
 app.get('/', (_req, res) => res.status(200).send('ok'));
+
+// Healthcheck — used by Railway and external monitors
 app.get('/health', (_req, res) =>
-  res.status(200).json({ ok: true, model: MODEL_NAME, sessions: sessions.size }),
+  res.status(200).json({
+    ok:      true,
+    ts:      new Date().toISOString(),
+    uptime:  Math.floor(process.uptime()),
+    models:  { primary: GEMINI_MODEL, fallback: OPENROUTER_MODEL },
+    sessions: sessions.size,
+  }),
 );
 
-app.post('/callback', middleware({ channelSecret }), (req, res) => {
-  // Ack LINE immediately so a slow handler can't trigger webhook retries (and duplicate Gemini calls).
-  // Reply tokens stay valid 60s independent of this response.
-  res.status(200).end();
-  Promise.allSettled((req.body.events || []).map(handleEvent)).catch((e) =>
-    console.error('[events]', e),
-  );
-});
+// LINE webhook
+app.post(
+  '/callback',
+  middleware({ channelSecret: process.env.LINE_CHANNEL_SECRET }),
+  (req, res) => {
+    // Acknowledge LINE immediately — reply tokens remain valid for 60 s
+    res.status(200).end();
+    Promise.allSettled((req.body.events || []).map(handleEvent)).catch((e) =>
+      logger.error('Event processing error', { err: e.message }),
+    );
+  },
+);
 
+// Error middleware
 app.use((err, _req, res, _next) => {
   if (err instanceof SignatureValidationFailed) return res.status(401).end();
-  if (err instanceof JSONParseError) return res.status(400).end();
-  console.error('[unhandled]', err.message);
+  if (err instanceof JSONParseError)            return res.status(400).end();
+  logger.error('Unhandled express error', { err: err.message });
   res.status(500).end();
 });
 
-process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
-process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
-
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () =>
-  console.log(`Bot ready on :${PORT} (model=${MODEL_NAME})`),
+process.on('unhandledRejection', (r) =>
+  logger.error('unhandledRejection', { err: String(r) }),
+);
+process.on('uncaughtException', (e) =>
+  logger.error('uncaughtException', { err: e.message }),
 );
 
-function shutdown(signal) {
-  console.log(`${signal} received, draining...`);
+// ── Start ─────────────────────────────────────────────────────────────────────
+const PORT   = process.env.PORT || 3000;
+const server = app.listen(PORT, () =>
+  logger.info('Bot started', { port: PORT, primary: GEMINI_MODEL, fallback: OPENROUTER_MODEL }),
+);
+
+function shutdown(sig) {
+  logger.info(`${sig} received, draining...`);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref();
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
