@@ -1,52 +1,43 @@
 'use strict';
 
 const EventEmitter = require('eventemitter3');
-const OpenAI       = require('@openrouter/sdk');
 const logger       = require('./logger');
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const TIMEOUT_MS      = 30_000;
 
 /**
- * OpenRouter Agent
- * Extends EventEmitter so callers can hook into lifecycle events:
- *   'thinking:start' | 'stream:delta' | 'item:update' | 'tool:call' |
- *   'tool:result'    | 'done'         | 'error'
+ * OpenRouter Agent (fetch-based, CommonJS-safe)
+ *
+ * Lifecycle events emitted:
+ *   'thinking:start' { userId, model }
+ *   'item:update'    { userId, model, text }
+ *   'tool:call'      { userId, name, args }
+ *   'tool:result'    { userId, name, result }
+ *   'done'           { userId, model, text }
+ *   'error'          { userId, err }
  */
 class Agent extends EventEmitter {
   /**
    * @param {object} opts
-   * @param {string} opts.apiKey       - OpenRouter API key
-   * @param {string} opts.model        - Model ID e.g. 'qwen/qwen3-32b'
+   * @param {string} opts.apiKey
+   * @param {string} opts.model       e.g. 'qwen/qwen3-32b:free'
    * @param {string} [opts.systemPrompt]
    * @param {string} [opts.siteUrl]
    * @param {string} [opts.siteName]
    */
   constructor({ apiKey, model, systemPrompt = '', siteUrl = '', siteName = '' }) {
     super();
+    this.apiKey       = apiKey;
     this.model        = model;
     this.systemPrompt = systemPrompt;
+    this.siteUrl      = siteUrl;
+    this.siteName     = siteName;
     this.tools        = new Map(); // name -> { schema, handler }
-
-    this.client = new OpenAI.default({
-      baseURL: OPENROUTER_BASE,
-      apiKey,
-      defaultHeaders: {
-        'HTTP-Referer': siteUrl,
-        'X-Title':      siteName,
-      },
-      timeout: TIMEOUT_MS,
-    });
   }
 
   // ── Tool registration ───────────────────────────────────────────────────────
 
-  /**
-   * Register a callable tool the model can invoke.
-   * @param {string}   name
-   * @param {object}   schema  - JSON Schema for parameters
-   * @param {Function} handler - async (params) => string
-   */
   registerTool(name, schema, handler) {
     this.tools.set(name, { schema, handler });
     return this;
@@ -59,16 +50,43 @@ class Agent extends EventEmitter {
     }));
   }
 
-  // ── Core: send a message and get a reply ────────────────────────────────────
+  // ── HTTP helper ───────────────────────────────────────────────────────────────
+
+  async _post(body) {
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+    try {
+      const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization:  `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': this.siteUrl,
+          'X-Title':      this.siteName,
+        },
+        body:   JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(`OpenRouter ${res.status}: ${raw.slice(0, 300)}`);
+      }
+
+      return res.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ── Core: send messages and return reply text ─────────────────────────────────
 
   /**
-   * Send conversation history + new user message, return reply text.
-   * Items-based: Map<itemId, content> — replaces chunks by ID.
-   *
-   * @param {Array<{role,content}>} history   - OpenAI-format history
-   * @param {string}                userText  - Latest user message
-   * @param {string}                [userId]  - For logging
-   * @returns {Promise<string>}               - Final assistant reply
+   * @param {Array<{role,content}>} history   OpenAI-format history (no system msg)
+   * @param {string}                userText
+   * @param {string}                [userId]
+   * @returns {Promise<string>}
    */
   async chat(history, userText, userId = 'anon') {
     this.emit('thinking:start', { userId, model: this.model });
@@ -80,27 +98,26 @@ class Agent extends EventEmitter {
     ];
 
     const toolDefs = this._toolDefinitions();
-    const reqOpts  = {
-      model:    this.model,
+    const reqBody  = {
+      model:       this.model,
       messages,
-      stream:   false,          // LINE OA doesn't support streaming
-      max_tokens: 1000,
+      max_tokens:  1000,
       temperature: 0.7,
       ...(toolDefs.length ? { tools: toolDefs, tool_choice: 'auto' } : {}),
     };
 
-    let response;
+    let data;
     try {
-      response = await this.client.chat.completions.create(reqOpts);
+      data = await this._post(reqBody);
     } catch (err) {
       this.emit('error', { userId, err: err.message });
       throw err;
     }
 
-    const choice  = response.choices?.[0];
+    const choice  = data.choices?.[0];
     const message = choice?.message;
 
-    // ── Tool call loop ────────────────────────────────────────────────────────
+    // ── Tool-call loop ────────────────────────────────────────────────────────
     if (message?.tool_calls?.length) {
       const toolMessages = [{ role: 'assistant', content: null, tool_calls: message.tool_calls }];
 
@@ -110,15 +127,12 @@ class Agent extends EventEmitter {
 
         let result;
         const entry = this.tools.get(name);
-        if (entry) {
-          try {
-            const parsed = JSON.parse(rawArgs);
-            result = String(await entry.handler(parsed));
-          } catch (e) {
-            result = `Error: ${e.message}`;
-          }
-        } else {
-          result = `Unknown tool: ${name}`;
+        try {
+          result = entry
+            ? String(await entry.handler(JSON.parse(rawArgs)))
+            : `Unknown tool: ${name}`;
+        } catch (e) {
+          result = `Error in tool ${name}: ${e.message}`;
         }
 
         this.emit('tool:result', { userId, name, result });
@@ -126,11 +140,10 @@ class Agent extends EventEmitter {
       }
 
       // Second call with tool results
-      const final = await this.client.chat.completions.create({
+      const final = await this._post({
         model:    this.model,
         messages: [...messages, ...toolMessages],
-        stream:   false,
-        max_tokens: 1000,
+        max_tokens:  1000,
         temperature: 0.7,
       });
 
@@ -142,7 +155,7 @@ class Agent extends EventEmitter {
     // ── Plain text reply ──────────────────────────────────────────────────────
     const text = message?.content || '';
     this.emit('item:update', { userId, model: this.model, text });
-    this.emit('done', { userId, model: this.model, text });
+    this.emit('done',        { userId, model: this.model, text });
     return text;
   }
 }
