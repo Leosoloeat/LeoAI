@@ -16,7 +16,7 @@ const {
   GEMINI_MODEL,
   OPENROUTER_MODELS,
 } = require('./src/ai');
-const { loadBrain, reloadBrain, appendMemory, updateTasks } = require('./src/brain');
+const { loadBrain, reloadBrain, appendMemory } = require('./src/brain');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
