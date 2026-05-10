@@ -1,35 +1,52 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// LeoAI — Google Apps Script (Standalone Web App)
+// LeoAI — Google Apps Script  |  Standalone Web App
+// ALWAYS returns JSON. Never returns HTML.
 //
-// Setup (ทำครั้งเดียว):
-//   1. script.google.com → เปิดโปรเจคนี้
-//   2. ลบ code เดิมทั้งหมด → paste code นี้แทน
-//   3. กด Save (disk icon)
-//   4. Run → เลือก function "setup" → กด Run
-//      (ครั้งแรกจะขอ authorize → กด Allow)
-//   5. Deploy → Manage deployments → Edit (ดินสอ) → Version: New version → Deploy
-//   6. Copy Web App URL ใหม่ → ใส่ใน Railway GOOGLE_SCRIPT_URL
+// ─── SETUP (ทำครั้งเดียว) ────────────────────────────────────────────────────
+// 1. script.google.com → เปิดโปรเจค LeoAI
+// 2. ลบ code เดิมทั้งหมด → Paste code นี้แทน → Save
+// 3. Run → setup → Allow (grant permissions)
+//    (Logs จะแสดง URL ของ Google Sheet ที่ถูกสร้าง)
+// 4. Deploy → Manage deployments → Edit (ดินสอ)
+//    → Version: New version → Deploy
+//    → Copy Web App URL ใหม่ → ใส่ใน Railway GOOGLE_SCRIPT_URL
 //
-// Sheet columns: timestamp | userId | memory | source
+// ─── DEPLOY SETTINGS (สำคัญมาก) ─────────────────────────────────────────────
+//    Execute as:      Me
+//    Who has access:  Anyone   ← ต้องเป็น "Anyone" ไม่ใช่ "Anyone with account"
+//
+// ─── TEST URLs ───────────────────────────────────────────────────────────────
+//    Ping:       GET  /exec?action=ping
+//    Get memory: GET  /exec?action=getMemory&limit=10
+//    Append:     POST /exec  body: {"action":"appendMemory","userId":"test","memory":"hello","source":"test"}
+//
+// ─── Expected JSON responses ─────────────────────────────────────────────────
+//    { "ok": true, "msg": "LeoAI Sheets online" }
+//    { "ok": true, "count": 3, "rows": [...] }
+//    { "ok": true, "action": "appendMemory" }
+//    { "ok": false, "error": "reason here" }
 // ─────────────────────────────────────────────────────────────────────────────
 
-var SPREADSHEET_NAME = 'LeoAI Memory';
-var SHEET_NAME       = 'Memory';
+var SHEET_NAME = 'Memory';
 
-// ── Get or create the spreadsheet ────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Sheet helper — auto-create spreadsheet + tab on first run
+// ─────────────────────────────────────────────────────────────────────────────
+
 function getSheet() {
-  var props   = PropertiesService.getScriptProperties();
-  var sheetId = props.getProperty('LEOAI_SHEET_ID');
-  var ss      = null;
+  var props = PropertiesService.getScriptProperties();
+  var id    = props.getProperty('LEOAI_SHEET_ID');
+  var ss    = null;
 
-  if (sheetId) {
-    try { ss = SpreadsheetApp.openById(sheetId); } catch (e) { ss = null; }
+  if (id) {
+    try { ss = SpreadsheetApp.openById(id); } catch (e) { ss = null; }
   }
 
   if (!ss) {
-    ss = SpreadsheetApp.create(SPREADSHEET_NAME);
-    props.setProperty('LEOAI_SHEET_ID', ss.getId());
-    Logger.log('Created new spreadsheet: ' + ss.getUrl());
+    ss    = SpreadsheetApp.create('LeoAI Memory');
+    id    = ss.getId();
+    props.setProperty('LEOAI_SHEET_ID', id);
+    Logger.log('Created spreadsheet: ' + ss.getUrl());
   }
 
   var sheet = ss.getSheetByName(SHEET_NAME);
@@ -38,74 +55,111 @@ function getSheet() {
     sheet.appendRow(['timestamp', 'userId', 'memory', 'source']);
     sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
     sheet.setFrozenRows(1);
+    Logger.log('Created sheet tab: ' + SHEET_NAME);
   }
 
   return sheet;
 }
 
-// ── Run this ONCE manually to authorize + create spreadsheet ─────────────────
-function setup() {
-  var sheet = getSheet();
-  var props = PropertiesService.getScriptProperties();
-  Logger.log('Sheet ready: ' + sheet.getParent().getUrl());
-  Logger.log('Sheet ID saved: ' + props.getProperty('LEOAI_SHEET_ID'));
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// doGet — handles GET requests
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ── POST /exec — append a memory row ─────────────────────────────────────────
-function doPost(e) {
+function doGet(e) {
+  // Outer try/catch: GUARANTEES JSON response even if everything inside crashes
   try {
-    var data   = JSON.parse(e.postData.contents);
-    var action = data.action;
+    var params = e.parameter || {};
+    var action = params.action || 'ping';
 
-    if (action === 'append') {
-      getSheet().appendRow([
-        data.timestamp || new Date().toISOString(),
-        data.userId    || 'unknown',
-        data.memory    || '',
-        data.source    || 'system',
-      ]);
-      return json({ ok: true });
+    // ── ping ──────────────────────────────────────────────────────────────────
+    if (action === 'ping') {
+      return makeJson({ ok: true, msg: 'LeoAI Sheets online', ts: new Date().toISOString() });
     }
 
-    return json({ ok: false, reason: 'Unknown action: ' + action });
-  } catch (err) {
-    return json({ ok: false, reason: err.message });
-  }
-}
+    // ── getMemory ─────────────────────────────────────────────────────────────
+    if (action === 'getMemory') {
+      var limit  = Math.min(parseInt(params.limit || '20', 10), 100);
+      var sheet  = getSheet();
+      var values = sheet.getDataRange().getValues();
 
-// ── GET /exec?action=load&limit=20 — fetch recent rows ───────────────────────
-function doGet(e) {
-  try {
-    var action = (e.parameter || {}).action;
-    var limit  = parseInt((e.parameter || {}).limit || '20', 10);
-
-    if (action === 'load') {
-      var values = getSheet().getDataRange().getValues();
-      var rows   = values.slice(1).slice(-limit).map(function(row) {
+      // Skip header row (row 0), take last N rows
+      var rows = values.slice(1).slice(-limit).map(function (row) {
         return {
-          timestamp: row[0],
-          userId:    row[1],
-          memory:    row[2],
-          source:    row[3],
+          timestamp: row[0] ? String(row[0]) : '',
+          userId:    row[1] ? String(row[1]) : '',
+          memory:    row[2] ? String(row[2]) : '',
+          source:    row[3] ? String(row[3]) : '',
         };
       });
-      return json({ ok: true, rows: rows });
+
+      return makeJson({ ok: true, count: rows.length, rows: rows });
     }
 
-    // Health check
-    if (action === 'ping') {
-      return json({ ok: true, msg: 'LeoAI Sheets online' });
-    }
+    return makeJson({ ok: false, error: 'Unknown action: ' + action });
 
-    return json({ ok: false, reason: 'Unknown action: ' + action });
   } catch (err) {
-    return json({ ok: false, reason: err.message });
+    // Always JSON, never HTML
+    return makeJson({ ok: false, error: 'doGet crashed: ' + err.message });
   }
 }
 
-// ── Helper ────────────────────────────────────────────────────────────────────
-function json(obj) {
+// ─────────────────────────────────────────────────────────────────────────────
+// doPost — handles POST requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+function doPost(e) {
+  try {
+    // Parse body safely
+    var body;
+    try {
+      body = JSON.parse(e.postData.contents);
+    } catch (parseErr) {
+      return makeJson({ ok: false, error: 'Invalid JSON body: ' + parseErr.message });
+    }
+
+    var action = body.action || '';
+
+    // ── appendMemory ──────────────────────────────────────────────────────────
+    if (action === 'appendMemory') {
+      if (!body.memory) return makeJson({ ok: false, error: 'memory field is required' });
+
+      getSheet().appendRow([
+        body.timestamp || new Date().toISOString(),
+        body.userId    || 'unknown',
+        body.memory,
+        body.source    || 'system',
+      ]);
+
+      Logger.log('Appended: ' + body.userId + ' | ' + body.memory.slice(0, 60));
+      return makeJson({ ok: true, action: 'appendMemory' });
+    }
+
+    return makeJson({ ok: false, error: 'Unknown action: ' + action });
+
+  } catch (err) {
+    return makeJson({ ok: false, error: 'doPost crashed: ' + err.message });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON helper — the ONLY output format used in this script
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeJson(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setup — run this ONCE manually to authorize + create spreadsheet
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setup() {
+  var sheet = getSheet();
+  var props = PropertiesService.getScriptProperties();
+  Logger.log('=== LeoAI Sheets Setup Complete ===');
+  Logger.log('Spreadsheet URL: ' + sheet.getParent().getUrl());
+  Logger.log('Sheet ID stored: ' + props.getProperty('LEOAI_SHEET_ID'));
+  Logger.log('Tab name: ' + sheet.getName());
 }

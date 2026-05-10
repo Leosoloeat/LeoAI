@@ -17,7 +17,7 @@ const {
   OPENROUTER_MODELS,
 } = require('./src/ai');
 const { loadBrain, reloadBrain, appendMemory } = require('./src/brain');
-const { loadMemoryFromSheets }                 = require('./src/sheets');
+const { loadMemoryFromSheets, pingSheets }     = require('./src/sheets');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -170,6 +170,17 @@ async function handleCommand(text, replyToken, userId) {
       const b = reloadBrain();
       const loaded = Object.entries(b).filter(([, v]) => v).map(([k]) => k).join(', ');
       return safeReply(replyToken, [`Brain reloaded\nFiles: ${loaded}`]);
+    }
+
+    case '/sheetstatus': {
+      const url = process.env.GOOGLE_SCRIPT_URL;
+      if (!url) return safeReply(replyToken, ['GOOGLE_SCRIPT_URL ยังไม่ได้ตั้งค่าครับ']);
+      const alive = await pingSheets();
+      const lines = [
+        `Google Sheets: ${alive ? 'Online' : 'Offline'}`,
+        `URL: ${url.slice(0, 60)}...`,
+      ];
+      return safeReply(replyToken, [lines.join('\n')]);
     }
 
     case '/remember': {
