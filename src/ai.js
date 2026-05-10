@@ -58,12 +58,12 @@ function classifyError(err) {
 const _cooldownMap = new Map(); // model -> cooldownUntil (ms)
 
 const COOLDOWN_MS = {
-  NO_ENDPOINTS: 15 * 60_000,  // 15 min — model truly unavailable
-  QUOTA:         5 * 60_000,  // 5 min  — quota exhausted
-  AUTH:         60 * 60_000,  // 1 hr   — bad key
-  UNAVAILABLE:   3 * 60_000,  // 3 min  — transient server error
-  TIMEOUT:       1 * 60_000,  // 1 min  — network issue
-  UNKNOWN:       2 * 60_000,  // 2 min  — unknown
+  NO_ENDPOINTS:  2 * 60_000,  // 2 min  — endpoint unavailable / 404
+  QUOTA:         5 * 60_000,  // 5 min  — 429 quota exhausted
+  AUTH:         60 * 60_000,  // 1 hr   — bad key (no point retrying)
+  UNAVAILABLE:   2 * 60_000,  // 2 min  — 502/503 transient
+  TIMEOUT:       1 * 60_000,  // 1 min  — network timeout
+  UNKNOWN:       2 * 60_000,  // 2 min  — unknown error
 };
 
 function setCooldown(model, kind) {
@@ -165,7 +165,7 @@ function getOrAgent(model) {
   return agent;
 }
 
-// Try each model in order, skip models on cooldown; auto-clear oldest if all cooling
+// Try up to 2 models sequentially — stop immediately on first success
 async function callOpenRouter(history, userText, userId) {
   if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
   if (OPENROUTER_MODELS.length === 0)   throw new Error('No OPENROUTER_MODEL env vars set');
@@ -176,24 +176,24 @@ async function callOpenRouter(history, userText, userId) {
     content: h.parts[0]?.text || '',
   }));
 
-  // Log active vs cooldown split before attempting
-  const activeModels   = OPENROUTER_MODELS.filter((m) => !isOnCooldown(m));
-  const cooldownModels = OPENROUTER_MODELS.filter((m) =>  isOnCooldown(m));
+  // Cap at 2 models to prevent excessive fallback loops
+  const candidates = OPENROUTER_MODELS.slice(0, 2);
+
+  const activeModels   = candidates.filter((m) => !isOnCooldown(m));
+  const cooldownModels = candidates.filter((m) =>  isOnCooldown(m));
   console.log(`[OR] Active models: ${activeModels.join(', ') || 'none'}`);
   if (cooldownModels.length) {
     console.log(`[OR] Cooldown models: ${cooldownModels.map((m) => `${m}(${cooldownRemainingMin(m)}m)`).join(', ')}`);
   }
 
   let lastErr;
-  let triedCount = 0;
 
-  for (const model of OPENROUTER_MODELS) {
+  for (const model of candidates) {
     if (isOnCooldown(model)) {
       logger.info('OR skipped (cooldown)', { userId, model, remainingMin: cooldownRemainingMin(model) });
       continue;
     }
 
-    triedCount++;
     console.log(`[OR] Selected model: ${model}`);
     logger.info('OR trying model', { userId, model });
 
@@ -201,7 +201,7 @@ async function callOpenRouter(history, userText, userId) {
       const agent = getOrAgent(model);
       const text  = await agent.chat(orHistory, userText, userId);
       if (!text?.trim()) throw new Error(`${model} returned empty response`);
-      console.log(`[OR] Reply success: ${model}`);
+      // Stop here — do NOT continue to next model
       return { text, model };
     } catch (err) {
       const kind = classifyError(err);
@@ -209,32 +209,11 @@ async function callOpenRouter(history, userText, userId) {
       logger.warn('OR model failed', { userId, model, kind, err: err.message.slice(0, 200) });
       setCooldown(model, kind);
       lastErr = err;
+      // continue to next candidate only if this one failed
     }
   }
 
-  // All models on cooldown — clear the one expiring soonest and try once
-  if (triedCount === 0) {
-    const cleared = clearOldestCooldown();
-    if (cleared) {
-      logger.warn('All OR models on cooldown — retrying with oldest', { userId, model: cleared });
-      console.log(`[OR] Selected model (emergency): ${cleared}`);
-      try {
-        const agent = getOrAgent(cleared);
-        const text  = await agent.chat(orHistory, userText, userId);
-        if (!text?.trim()) throw new Error(`${cleared} returned empty response`);
-        console.log(`[OR] Reply success (emergency): ${cleared}`);
-        return { text, model: cleared };
-      } catch (err) {
-        const kind = classifyError(err);
-        console.log(`[OR] Emergency attempt failed: ${cleared} | ${kind}`);
-        setCooldown(cleared, kind);
-        lastErr = err;
-      }
-    }
-    throw lastErr || new Error('All OpenRouter models exhausted (all on cooldown)');
-  }
-
-  throw lastErr || new Error('All OpenRouter models exhausted');
+  throw lastErr || new Error('All OpenRouter candidates exhausted');
 }
 
 // ── System status (for /debug and /health commands) ───────────────────────────
@@ -273,28 +252,31 @@ async function generateReply(history, userText, userId) {
 
   const fullHistory = [...brainHistory, ...history];
 
-  // 1. Gemini (primary, with retry)
+  // 1. Gemini (primary) — if success, return immediately, never touch OpenRouter
+  console.log('[AI] Using Gemini');
   try {
     const result = await callGeminiWithRetry(fullHistory, userText, userId);
     logger.info('Reply OK', { userId, model: result.model, latencyMs: Date.now() - start, tokenEst });
-    return result;
+    return result; // ← stop here
   } catch (err) {
+    console.log('[AI] Gemini failed → fallback OpenRouter');
     logger.warn('Gemini failed — switching to OpenRouter', {
       userId, kind: classifyError(err), err: err.message,
     });
   }
 
-  // 2. OpenRouter chain
+  // 2. OpenRouter (max 2 models, sequential, stop on first success)
   if (process.env.OPENROUTER_API_KEY && OPENROUTER_MODELS.length > 0) {
     try {
       const result = await callOpenRouter(fullHistory, userText, userId);
+      console.log('[AI] OpenRouter success');
       logger.info('Reply OK via OpenRouter', {
         userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
       });
-      return result;
+      return result; // ← stop here
     } catch (err) {
-      logger.error('All OpenRouter models failed', {
-        userId, err: err.message, triedModels: OPENROUTER_MODELS,
+      logger.error('OpenRouter candidates exhausted', {
+        userId, err: err.message,
       });
     }
   }
