@@ -13,26 +13,33 @@ const GEMINI_TIMEOUT_MS = 12_000;
 const MAX_GEMINI_RETRY  = 2;
 
 /**
- * Support two env var formats (deduplicated, order preserved):
- *   1. OPENROUTER_MODELS=a,b,c           (comma-separated, plural)
- *   2. OPENROUTER_MODEL=a  OPENROUTER_MODEL2=b  … (numbered, singular)
- * Both formats may be mixed — result is merged and deduplicated.
+ * Parse OpenRouter model list from env vars.
+ * Supports three formats — all deduplicated and comma-safe:
+ *   1. OPENROUTER_MODELS=a,b,c           (plural, comma-separated)
+ *   2. OPENROUTER_MODEL=a,b,c            (singular, comma-separated)
+ *   3. OPENROUTER_MODEL=a  OPENROUTER_MODEL2=b … (numbered, one per var)
+ * Any single env var may contain multiple models joined by commas.
  */
 function loadOpenRouterModels() {
   const seen   = new Set();
   const result = [];
 
-  function add(val) {
-    const v = (val || '').trim();
-    if (v && !seen.has(v)) { seen.add(v); result.push(v); }
+  // Always split by comma so "a,b,c" in ONE var → three separate models
+  function addRaw(raw) {
+    (raw || '').split(',').forEach((s) => {
+      const v = s.trim();
+      if (!v) return;
+      if (v.includes(',')) {
+        throw new Error(`[OR] Parsing error: model entry still contains comma after split: "${v}"`);
+      }
+      if (!seen.has(v)) { seen.add(v); result.push(v); }
+    });
   }
 
-  // Format 1: OPENROUTER_MODELS=a,b,c  (plural)
-  if (process.env.OPENROUTER_MODELS) {
-    process.env.OPENROUTER_MODELS.split(',').forEach((s) => add(s));
-  }
+  // Format 1: OPENROUTER_MODELS=a,b,c  (plural key)
+  if (process.env.OPENROUTER_MODELS) addRaw(process.env.OPENROUTER_MODELS);
 
-  // Format 2: OPENROUTER_MODEL / OPENROUTER_MODEL2 … (numbered)
+  // Format 2+3: OPENROUTER_MODEL / OPENROUTER_MODEL2 … (singular key, numbered)
   Object.entries(process.env)
     .filter(([key]) => /^OPENROUTER_MODEL\d*$/.test(key))
     .map(([key, val]) => ({
@@ -40,7 +47,7 @@ function loadOpenRouterModels() {
       val,
     }))
     .sort((a, b) => a.order - b.order)
-    .forEach(({ val }) => add(val));
+    .forEach(({ val }) => addRaw(val));
 
   return result;
 }
@@ -48,8 +55,16 @@ function loadOpenRouterModels() {
 const OPENROUTER_MODELS = loadOpenRouterModels();
 const OPENROUTER_MODEL  = OPENROUTER_MODELS[0] || 'none';
 
+// Startup validation — catch any entry that still contains a comma
+OPENROUTER_MODELS.forEach((m) => {
+  if (m.includes(',')) {
+    throw new Error(`[OR] Parsing error: model entry contains comma: "${m}" — check OPENROUTER_MODEL* env vars`);
+  }
+});
+
 console.log('[AI] Gemini model:', GEMINI_MODEL);
-console.log('[AI] OpenRouter models:', OPENROUTER_MODELS);
+console.log('[OR] Parsed models:', OPENROUTER_MODELS);
+console.log('[OR] Model count:', OPENROUTER_MODELS.length);
 
 // ── Gemini client ─────────────────────────────────────────────────────────────
 
@@ -250,7 +265,8 @@ async function callOpenRouter(history, userText, userId) {
 
       recordWin(model);
       clearCooldown(model);
-      console.log(`[OR] Success: ${model}`);
+      console.log(`[OR] Success: model=${model} score=${healthScore(model).toFixed(2)} chars=${text.length}`);
+      logger.info('OR model success', { userId, model, chars: text.length, score: healthScore(model).toFixed(2) });
       return { text, model };
     } catch (err) {
       const kind = classifyError(err);
@@ -275,12 +291,13 @@ function getSystemStatus() {
       keySet: !!process.env.GEMINI_API_KEY,
     },
     openrouter: {
-      keySet: !!process.env.OPENROUTER_API_KEY,
-      models: OPENROUTER_MODELS.map((m) => {
+      keySet:     !!process.env.OPENROUTER_API_KEY,
+      modelCount: OPENROUTER_MODELS.length,
+      models:     OPENROUTER_MODELS.map((m) => {
         const h      = _healthMap.get(m) || { wins: 0, losses: 0 };
         const broken = isPermanentlyBroken(m);
         return {
-          model:  m,
+          model:  m,   // always one model string, never comma-separated
           status: broken ? 'broken' : isOnCooldown(m) ? `cooldown ${cooldownRemainingStr(m)}` : 'ready',
           score:  healthScore(m).toFixed(2),
           wins:   h.wins,
