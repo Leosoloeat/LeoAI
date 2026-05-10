@@ -84,6 +84,7 @@ function classifyError(err) {
   if (/timeout|aborted|socket.hang/i.test(msg))                                       return 'TIMEOUT';
   if (/503|502|service.unavailable/i.test(msg))                                       return 'UNAVAILABLE';
   if (/404/i.test(msg))                                                                return 'NO_ENDPOINTS';
+  if (/fetch failed|econnrefused|econnreset|enotfound|network|dns/i.test(msg))        return 'NETWORK';
   return 'UNKNOWN';
 }
 
@@ -92,12 +93,13 @@ function classifyError(err) {
 const _cooldownMap = new Map(); // model -> expiresAt (ms)
 
 const COOLDOWN_MS = {
-  NO_ENDPOINTS: 10 * 60_000,  // 10 min — 404 / model not found
-  QUOTA:         1 * 60_000,  //  1 min — 429 rate limit
+  NO_ENDPOINTS:  3 * 60_000,  //  3 min — 404 / model not found (free models go down often)
+  QUOTA:            90_000,   // 90 sec — 429 rate limit
   AUTH:         60 * 60_000,  //  1 hr  — bad key (no point retrying)
   UNAVAILABLE:      30_000,   // 30 sec — temporary overload
   TIMEOUT:          15_000,   // 15 sec — network timeout
-  UNKNOWN:       2 * 60_000,  //  2 min — unknown error
+  NETWORK:               0,   //  0 sec — network error, retry next model immediately
+  UNKNOWN:          60_000,   //  1 min — unknown error
 };
 
 function _msToStr(ms) {
@@ -106,6 +108,10 @@ function _msToStr(ms) {
 
 function setCooldown(model, kind) {
   const ms = COOLDOWN_MS[kind] ?? COOLDOWN_MS.UNKNOWN;
+  if (ms === 0) {
+    console.log(`[OR] No cooldown for ${model} (${kind}) — retry next model immediately`);
+    return;
+  }
   _cooldownMap.set(model, Date.now() + ms);
   console.log(`[OR] cooldown set:\n  model=${model}\n  reason=${kind}\n  duration=${_msToStr(ms)}`);
   logger.warn('OR cooldown set', { model, reason: kind, duration: _msToStr(ms) });
@@ -121,7 +127,11 @@ function clearCooldown(model) {
 function isOnCooldown(model) {
   const until = _cooldownMap.get(model);
   if (!until) return false;
-  if (Date.now() > until) { _cooldownMap.delete(model); return false; }
+  if (Date.now() > until) {
+    _cooldownMap.delete(model);
+    console.log(`[OR] cooldown expired: ${model} → ready`);
+    return false;
+  }
   return true;
 }
 
@@ -153,10 +163,10 @@ function healthScore(model) {
   return h.wins / (h.wins + h.losses);
 }
 
-// Permanently broken = 0 wins after ≥5 losses (skipped until process restart)
+// Permanently broken = 0 wins after ≥10 consecutive losses (free models are unreliable — be lenient)
 function isPermanentlyBroken(model) {
   const h = _healthMap.get(model);
-  return !!h && h.wins === 0 && h.losses >= 5;
+  return !!h && h.wins === 0 && h.losses >= 10;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -308,6 +318,11 @@ function getSystemStatus() {
   };
 }
 
+// ── OR exhaustion cache — avoid hammering static fallback every message ───────
+// When all OR models fail together, skip OR for 30s to prevent spam.
+// Resets to 0 on any successful OR reply.
+let _orExhaustedUntil = 0;
+
 // ── Main: Gemini → OpenRouter chain → static fallback ─────────────────────────
 
 async function generateReply(history, userText, userId) {
@@ -341,26 +356,37 @@ async function generateReply(history, userText, userId) {
 
   // 2. OpenRouter (all available models, health-sorted) — return immediately on success
   if (process.env.OPENROUTER_API_KEY && OPENROUTER_MODELS.length > 0) {
-    try {
-      const result = await callOpenRouter(fullHistory, userText, userId);
-      if (!result?.text?.trim()) throw new Error('OpenRouter returned empty text');
-      console.log(`[AI] Generated response (OpenRouter/${result.model}): "${result.text.slice(0, 60)}..."`);
-      console.log('[AI] OpenRouter success');
-      logger.info('Reply OK via OpenRouter', {
-        userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
-      });
-      return result;
-    } catch (err) {
-      logger.error('OpenRouter candidates exhausted', { userId, err: err.message });
+    const orSkipRemaining = _orExhaustedUntil - Date.now();
+    if (orSkipRemaining > 0) {
+      console.log(`[OR] Skip — all failed recently (${Math.ceil(orSkipRemaining / 1_000)}s cache)`);
+    } else {
+      try {
+        const result = await callOpenRouter(fullHistory, userText, userId);
+        if (!result?.text?.trim()) throw new Error('OpenRouter returned empty text');
+        _orExhaustedUntil = 0; // reset cache on success
+        console.log(`[AI] Generated response (OpenRouter/${result.model}): "${result.text.slice(0, 60)}..."`);
+        console.log('[AI] OpenRouter success');
+        logger.info('Reply OK via OpenRouter', {
+          userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
+        });
+        return result;
+      } catch (err) {
+        _orExhaustedUntil = Date.now() + 30_000; // suppress OR for 30s after total failure
+        logger.error('OpenRouter candidates exhausted', { userId, err: err.message });
+      }
     }
   }
 
   // 3. Static fallback — only if ALL providers fail
+  // Use varied messages so it doesn't feel robotic
+  const fallbackMessages = [
+    'ขออภัยครับ ระบบ AI ติดขัดชั่วคราว ลองใหม่ใน 30 วินาทีนะครับ',
+    'โมเดล AI กำลังโหลดอยู่ครับ รอแป๊บนึงแล้วลองใหม่ได้เลยครับ',
+    'ตอนนี้ระบบมีโหลดสูงครับ ลองถามใหม่อีกครั้งในอีกสักครู่นะครับ',
+  ];
+  const msg = fallbackMessages[Math.floor(Math.random() * fallbackMessages.length)];
   logger.error('All AI providers failed — static response', { userId, latencyMs: Date.now() - start });
-  return {
-    text:  'ขออภัยครับ ระบบ AI กำลังโหลดอยู่ ลองใหม่อีกครั้งใน 1-2 นาทีนะครับ 🙏',
-    model: 'static-fallback',
-  };
+  return { text: msg, model: 'static-fallback' };
 }
 
 module.exports = {
