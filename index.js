@@ -10,7 +10,7 @@ const {
   JSONParseError,
 } = require('@line/bot-sdk');
 
-const { generateReply, GEMINI_MODEL, OPENROUTER_MODEL } = require('./src/ai');
+const { generateReply, GEMINI_MODEL, OPENROUTER_MODEL, OPENROUTER_MODELS } = require('./src/ai');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -166,7 +166,7 @@ app.get('/health', (_req, res) =>
     ok:      true,
     ts:      new Date().toISOString(),
     uptime:  Math.floor(process.uptime()),
-    models:  { primary: GEMINI_MODEL, fallback: OPENROUTER_MODEL },
+    models:  { primary: GEMINI_MODEL, fallbacks: OPENROUTER_MODELS },
     sessions: sessions.size,
   }),
 );
@@ -202,7 +202,7 @@ process.on('uncaughtException', (e) =>
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () =>
-  logger.info('Bot started', { port: PORT, primary: GEMINI_MODEL, fallback: OPENROUTER_MODEL }),
+  logger.info('Bot started', { port: PORT, primary: GEMINI_MODEL, fallbacks: OPENROUTER_MODELS }),
 );
 
 function shutdown(sig) {
