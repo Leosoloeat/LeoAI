@@ -1,33 +1,54 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// LeoAI — Google Apps Script (deploy as Web App)
+// LeoAI — Google Apps Script (Standalone Web App)
 //
-// Setup:
-//   1. Go to script.google.com → New project
-//   2. Paste this entire file (replace default code)
-//   3. Deploy → New deployment → Web App
-//      Execute as: Me
-//      Who has access: Anyone
-//   4. Copy the Web App URL
-//   5. Add to Railway Variables:
-//      GOOGLE_SCRIPT_URL = <paste URL here>
-//   6. Redeploy Railway
+// Setup (ทำครั้งเดียว):
+//   1. script.google.com → เปิดโปรเจคนี้
+//   2. ลบ code เดิมทั้งหมด → paste code นี้แทน
+//   3. กด Save (disk icon)
+//   4. Run → เลือก function "setup" → กด Run
+//      (ครั้งแรกจะขอ authorize → กด Allow)
+//   5. Deploy → Manage deployments → Edit (ดินสอ) → Version: New version → Deploy
+//   6. Copy Web App URL ใหม่ → ใส่ใน Railway GOOGLE_SCRIPT_URL
 //
 // Sheet columns: timestamp | userId | memory | source
 // ─────────────────────────────────────────────────────────────────────────────
 
-var SHEET_NAME = 'Memory'; // change if you want a different tab name
+var SPREADSHEET_NAME = 'LeoAI Memory';
+var SHEET_NAME       = 'Memory';
 
+// ── Get or create the spreadsheet ────────────────────────────────────────────
 function getSheet() {
-  var ss    = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAME);
+  var props   = PropertiesService.getScriptProperties();
+  var sheetId = props.getProperty('LEOAI_SHEET_ID');
+  var ss      = null;
 
+  if (sheetId) {
+    try { ss = SpreadsheetApp.openById(sheetId); } catch (e) { ss = null; }
+  }
+
+  if (!ss) {
+    ss = SpreadsheetApp.create(SPREADSHEET_NAME);
+    props.setProperty('LEOAI_SHEET_ID', ss.getId());
+    Logger.log('Created new spreadsheet: ' + ss.getUrl());
+  }
+
+  var sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
-    // Create sheet + header row on first run
     sheet = ss.insertSheet(SHEET_NAME);
     sheet.appendRow(['timestamp', 'userId', 'memory', 'source']);
     sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
+    sheet.setFrozenRows(1);
   }
+
   return sheet;
+}
+
+// ── Run this ONCE manually to authorize + create spreadsheet ─────────────────
+function setup() {
+  var sheet = getSheet();
+  var props = PropertiesService.getScriptProperties();
+  Logger.log('Sheet ready: ' + sheet.getParent().getUrl());
+  Logger.log('Sheet ID saved: ' + props.getProperty('LEOAI_SHEET_ID'));
 }
 
 // ── POST /exec — append a memory row ─────────────────────────────────────────
@@ -59,11 +80,8 @@ function doGet(e) {
     var limit  = parseInt((e.parameter || {}).limit || '20', 10);
 
     if (action === 'load') {
-      var sheet  = getSheet();
-      var values = sheet.getDataRange().getValues();
-
-      // Skip header row, take last N rows
-      var rows = values.slice(1).slice(-limit).map(function(row) {
+      var values = getSheet().getDataRange().getValues();
+      var rows   = values.slice(1).slice(-limit).map(function(row) {
         return {
           timestamp: row[0],
           userId:    row[1],
@@ -71,8 +89,12 @@ function doGet(e) {
           source:    row[3],
         };
       });
-
       return json({ ok: true, rows: rows });
+    }
+
+    // Health check
+    if (action === 'ping') {
+      return json({ ok: true, msg: 'LeoAI Sheets online' });
     }
 
     return json({ ok: false, reason: 'Unknown action: ' + action });
