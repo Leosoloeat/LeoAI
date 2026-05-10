@@ -6,9 +6,8 @@ const logger = require('./logger');
 
 const GEMINI_MODEL       = process.env.GEMINI_MODEL       || 'gemini-2.5-flash';
 const OPENROUTER_MODEL   = process.env.OPENROUTER_MODEL   || 'deepseek/deepseek-chat-v3-0324:free';
-const GEMINI_TIMEOUT_MS  = 25_000;
-const OPENROUTER_TIMEOUT = 30_000;
-const MAX_RETRIES        = 3;
+const GEMINI_TIMEOUT_MS = 25_000;
+const MAX_RETRIES       = 3;
 
 // Initialise Gemini client once at startup
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -67,55 +66,48 @@ async function callGeminiWithRetry(history, userText, userId) {
   throw lastErr;
 }
 
-// ── OpenRouter (fetch-based, OpenAI-compatible) ───────────────────────────────
+// ── OpenRouter Agent (via @openrouter/sdk + EventEmitter) ────────────────────
 
-async function callOpenRouter(history, userText) {
+const { Agent } = require('./agent');
+
+// Lazy-init: only create agent if key is present
+let _orAgent = null;
+function getOrAgent() {
+  if (_orAgent) return _orAgent;
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error('OPENROUTER_API_KEY not configured');
 
+  _orAgent = new Agent({
+    apiKey,
+    model:        OPENROUTER_MODEL,
+    systemPrompt: LEO_AI_SYSTEM_PROMPT,
+    siteUrl:      'https://leoai-production.up.railway.app',
+    siteName:     'Leo AI LINE OA',
+  });
+
+  // Wire agent events → logger
+  _orAgent.on('thinking:start', ({ userId, model }) =>
+    logger.info('OpenRouter thinking', { userId, model }),
+  );
+  _orAgent.on('tool:call',   ({ userId, name })   => logger.info('Tool call',   { userId, name }));
+  _orAgent.on('tool:result', ({ userId, name })   => logger.info('Tool result', { userId, name }));
+  _orAgent.on('error',       ({ userId, err })    => logger.error('Agent error', { userId, err }));
+
+  return _orAgent;
+}
+
+async function callOpenRouter(history, userText, userId) {
+  const agent = getOrAgent();
+
   // Convert Gemini history format → OpenAI messages
-  const messages = [
-    { role: 'system', content: LEO_AI_SYSTEM_PROMPT },
-    ...history.map((h) => ({
-      role: h.role === 'model' ? 'assistant' : 'user',
-      content: h.parts[0]?.text || '',
-    })),
-    { role: 'user', content: userText },
-  ];
+  const orHistory = history.map((h) => ({
+    role:    h.role === 'model' ? 'assistant' : 'user',
+    content: h.parts[0]?.text || '',
+  }));
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT);
-
-  try {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization:  `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://leoai-production.up.railway.app',
-        'X-Title':      'Leo AI LINE OA',
-      },
-      body: JSON.stringify({
-        model:      OPENROUTER_MODEL,
-        messages,
-        max_tokens:  1000,
-        temperature: 0.7,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`OpenRouter ${res.status}: ${body.slice(0, 200)}`);
-    }
-
-    const data = await res.json();
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) throw new Error('OpenRouter returned empty content');
-    return { text, model: OPENROUTER_MODEL };
-  } finally {
-    clearTimeout(timer);
-  }
+  const text = await agent.chat(orHistory, userText, userId);
+  if (!text) throw new Error('OpenRouter returned empty content');
+  return { text, model: OPENROUTER_MODEL };
 }
 
 // ── Main entry: Gemini → OpenRouter → static fallback ────────────────────────
@@ -138,7 +130,7 @@ async function generateReply(history, userText, userId) {
   // 2. OpenRouter fallback
   if (process.env.OPENROUTER_API_KEY) {
     try {
-      const result = await callOpenRouter(history, userText);
+      const result = await callOpenRouter(history, userText, userId);
       logger.info('AI reply via OpenRouter', {
         userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
       });
