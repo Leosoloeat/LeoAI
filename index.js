@@ -10,11 +10,17 @@ const {
   JSONParseError,
 } = require('@line/bot-sdk');
 
-const { generateReply, GEMINI_MODEL, OPENROUTER_MODEL, OPENROUTER_MODELS } = require('./src/ai');
+const {
+  generateReply,
+  getSystemStatus,
+  GEMINI_MODEL,
+  OPENROUTER_MODELS,
+} = require('./src/ai');
+const { loadBrain, appendMemory, updateTasks } = require('./src/brain');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
-// ── Startup validation ────────────────────────────────────────────────────────
+// ── Startup validation ─────────────────────────────────────────────────────────
 const REQUIRED = ['LINE_CHANNEL_ACCESS_TOKEN', 'LINE_CHANNEL_SECRET', 'GEMINI_API_KEY'];
 const missing  = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
@@ -25,18 +31,18 @@ if (!process.env.OPENROUTER_API_KEY) {
   console.warn('[startup] OPENROUTER_API_KEY not set — OpenRouter fallback disabled');
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 const LINE_MAX_TEXT       = 4_900;
 const MAX_HISTORY_ENTRIES = 20;
 const SESSION_TTL_MS      = 30 * 60_000;
 
-// ── LINE client ───────────────────────────────────────────────────────────────
+// ── LINE client ────────────────────────────────────────────────────────────────
 const client = new messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// ── In-memory session store ───────────────────────────────────────────────────
-const sessions = new Map(); // userId -> { history, lastActive }
+// ── Session store ──────────────────────────────────────────────────────────────
+const sessions = new Map();
 
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
@@ -45,27 +51,22 @@ setInterval(() => {
 
 function getSession(userId) {
   let s = sessions.get(userId);
-  if (!s) {
-    s = { history: [], lastActive: Date.now() };
-    sessions.set(userId, s);
-  }
+  if (!s) { s = { history: [], lastActive: Date.now() }; sessions.set(userId, s); }
   return s;
 }
 
-// ── Text helpers ──────────────────────────────────────────────────────────────
+// ── Text helpers ───────────────────────────────────────────────────────────────
 
-// LINE doesn't render markdown — strip it so text reads cleanly
 function stripMarkdown(text) {
   return text
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '$1')
-    .replace(/`([^`]+)`/g,  '$1')
+    .replace(/`([^`]+)`/g, '$1')
     .replace(/^#{1,6}\s+/gm, '')
-    .replace(/^---+$/gm,     '')
+    .replace(/^---+$/gm, '')
     .replace(/^\s*[-*]\s+/gm, '• ');
 }
 
-// Split long responses into ≤4 900-char LINE messages
 function chunkForLine(text) {
   const chunks = [];
   let rest = text.trim();
@@ -91,9 +92,81 @@ async function safeReply(replyToken, texts) {
   }
 }
 
-// ── Event handler ─────────────────────────────────────────────────────────────
+// ── Slash command handler ──────────────────────────────────────────────────────
+
+async function handleCommand(text, replyToken, userId) {
+  const cmd = text.trim().toLowerCase().split(/\s+/)[0];
+  const args = text.trim().slice(cmd.length).trim();
+
+  switch (cmd) {
+    case '/health': {
+      const s = getSystemStatus();
+      const orLines = s.openrouter.models.length
+        ? s.openrouter.models.map((m) => `• ${m.model}: ${m.status}`).join('\n')
+        : '• ไม่มี model';
+      const reply = [
+        `Leo AI System Health`,
+        `Uptime: ${s.uptime}s | Sessions: ${sessions.size}`,
+        ``,
+        `Gemini: ${s.gemini.model}`,
+        `Key: ${s.gemini.keySet ? 'OK' : 'MISSING'}`,
+        ``,
+        `OpenRouter: ${s.openrouter.keySet ? 'OK' : 'MISSING'}`,
+        orLines,
+      ].join('\n');
+      return safeReply(replyToken, [reply]);
+    }
+
+    case '/model': {
+      const s = getSystemStatus();
+      const ready = s.openrouter.models.filter((m) => m.status === 'ready').map((m) => m.model);
+      const cooling = s.openrouter.models.filter((m) => m.status !== 'ready').map((m) => `${m.model} (${m.status})`);
+      const lines = [
+        `Primary: ${GEMINI_MODEL}`,
+        ``,
+        `Fallback ready (${ready.length}):`,
+        ...ready.map((m) => `• ${m}`),
+      ];
+      if (cooling.length) {
+        lines.push(``, `Cooldown (${cooling.length}):`, ...cooling.map((m) => `• ${m}`));
+      }
+      return safeReply(replyToken, [lines.join('\n')]);
+    }
+
+    case '/debug': {
+      const s = getSystemStatus();
+      const out = JSON.stringify(s, null, 2);
+      return safeReply(replyToken, [out.slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/brain': {
+      const b = loadBrain();
+      const lines = [
+        `Brain System`,
+        ``,
+        `Memory:`,
+        b.memory || '(empty)',
+        ``,
+        `Tasks:`,
+        b.tasks || '(empty)',
+      ];
+      return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/remember': {
+      if (!args) return safeReply(replyToken, ['ใส่ข้อความที่จะจำด้วยครับ เช่น /remember ลูกค้าชอบราคาถูก']);
+      appendMemory(`[${userId.slice(-6)}] ${args}`);
+      return safeReply(replyToken, [`จำไว้แล้วครับ: "${args}"`]);
+    }
+
+    default:
+      return null; // unknown command — let AI handle it
+  }
+}
+
+// ── Event handler ──────────────────────────────────────────────────────────────
+
 async function handleEvent(event) {
-  // New follower welcome
   if (event.type === 'follow') {
     return safeReply(event.replyToken, [
       'ขอบคุณที่เพิ่มเป็นเพื่อนครับ Leo Ai พร้อมช่วยเรื่อง LINE OA AI automation และ viral content',
@@ -104,14 +177,20 @@ async function handleEvent(event) {
   if (event.type !== 'message') return null;
 
   if (event.message.type !== 'text') {
-    return safeReply(event.replyToken, [
-      'ตอนนี้รับเฉพาะข้อความตัวอักษรครับ พิมพ์เล่ามาได้เลย',
-    ]);
+    return safeReply(event.replyToken, ['ตอนนี้รับเฉพาะข้อความตัวอักษรครับ พิมพ์เล่ามาได้เลย']);
   }
 
-  const userId = event.source?.userId || 'anonymous';
+  const userId  = event.source?.userId || 'anonymous';
+  const msgText = event.message.text.trim();
 
-  // Rate limiting — prevent spam and double-sends
+  // Handle slash commands first (bypass rate limiter — always fast)
+  if (msgText.startsWith('/')) {
+    const handled = await handleCommand(msgText, event.replyToken, userId);
+    if (handled !== null) return handled;
+    // null = unknown command, fall through to AI
+  }
+
+  // Rate limiting
   const rate = rateLimiter.check(userId);
   if (!rate.ok) {
     const msg = rate.reason === 'pending'
@@ -125,23 +204,16 @@ async function handleEvent(event) {
   session.lastActive = Date.now();
 
   try {
-    const { text: raw } = await generateReply(
-      session.history,
-      event.message.text,
-      userId,
-    );
+    const { text: raw } = await generateReply(session.history, msgText, userId);
 
     if (!raw?.trim()) {
-      return safeReply(event.replyToken, [
-        'ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ',
-      ]);
+      return safeReply(event.replyToken, ['ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ']);
     }
 
     const cleaned = stripMarkdown(raw);
 
-    // Persist conversation history for context
     session.history.push(
-      { role: 'user',  parts: [{ text: event.message.text }] },
+      { role: 'user',  parts: [{ text: msgText }] },
       { role: 'model', parts: [{ text: cleaned }] },
     );
     if (session.history.length > MAX_HISTORY_ENTRIES) {
@@ -154,37 +226,37 @@ async function handleEvent(event) {
   }
 }
 
-// ── Express app ───────────────────────────────────────────────────────────────
+// ── Express app ────────────────────────────────────────────────────────────────
+
 const app = express();
 
-// Railway keep-alive ping
 app.get('/', (_req, res) => res.status(200).send('ok'));
 
-// Healthcheck — used by Railway and external monitors
-app.get('/health', (_req, res) =>
+app.get('/health', (_req, res) => {
+  const s = getSystemStatus();
   res.status(200).json({
-    ok:      true,
-    ts:      new Date().toISOString(),
-    uptime:  Math.floor(process.uptime()),
-    models:  { primary: GEMINI_MODEL, fallbacks: OPENROUTER_MODELS },
+    ok:       true,
+    ts:       new Date().toISOString(),
+    uptime:   s.uptime,
     sessions: sessions.size,
-  }),
-);
+    models: {
+      primary:   GEMINI_MODEL,
+      fallbacks: s.openrouter.models,
+    },
+  });
+});
 
-// LINE webhook
 app.post(
   '/callback',
   middleware({ channelSecret: process.env.LINE_CHANNEL_SECRET }),
   (req, res) => {
-    // Acknowledge LINE immediately — reply tokens remain valid for 60 s
-    res.status(200).end();
+    res.status(200).end(); // ack LINE immediately
     Promise.allSettled((req.body.events || []).map(handleEvent)).catch((e) =>
       logger.error('Event processing error', { err: e.message }),
     );
   },
 );
 
-// Error middleware
 app.use((err, _req, res, _next) => {
   if (err instanceof SignatureValidationFailed) return res.status(401).end();
   if (err instanceof JSONParseError)            return res.status(400).end();
@@ -192,14 +264,11 @@ app.use((err, _req, res, _next) => {
   res.status(500).end();
 });
 
-process.on('unhandledRejection', (r) =>
-  logger.error('unhandledRejection', { err: String(r) }),
-);
-process.on('uncaughtException', (e) =>
-  logger.error('uncaughtException', { err: e.message }),
-);
+process.on('unhandledRejection', (r) => logger.error('unhandledRejection', { err: String(r) }));
+process.on('uncaughtException',  (e) => logger.error('uncaughtException',  { err: e.message }));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────────────
+
 const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () =>
   logger.info('Bot started', { port: PORT, primary: GEMINI_MODEL, fallbacks: OPENROUTER_MODELS }),
