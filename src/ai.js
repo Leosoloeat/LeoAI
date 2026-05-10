@@ -11,21 +11,21 @@ const GEMINI_MODEL      = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_TIMEOUT_MS = 25_000;
 const MAX_RETRIES       = 3;
 
-// Collect all OPENROUTER_MODEL, OPENROUTER_MODEL2, OPENROUTER_MODEL3 … in order
+// Explicit list — no string manipulation, no accidental "KEY=value" prepend
 function loadOpenRouterModels() {
-  const models = [];
-  let i = 1;
-  while (true) {
-    const key = i === 1 ? 'OPENROUTER_MODEL' : `OPENROUTER_MODEL${i}`;
-    const val = process.env[key];
-    if (!val) break;
-    models.push(val.trim());
-    i++;
-  }
-  return models;
+  return [
+    process.env.OPENROUTER_MODEL,
+    process.env.OPENROUTER_MODEL2,
+    process.env.OPENROUTER_MODEL3,
+  ]
+    .filter(Boolean)          // remove undefined / null / empty string
+    .map((m) => m.trim());    // strip accidental whitespace
 }
 
 const OPENROUTER_MODELS = loadOpenRouterModels();
+
+// Startup: print resolved model list so Railway logs show actual values immediately
+console.log('[AI] OpenRouter models loaded:', OPENROUTER_MODELS);
 
 // Export primary fallback model name for /health endpoint
 const OPENROUTER_MODEL = OPENROUTER_MODELS[0] || 'none';
@@ -128,17 +128,20 @@ async function callOpenRouter(history, userText, userId) {
 
   let lastErr;
   for (const model of OPENROUTER_MODELS) {
+    // console.log for Railway raw logs — visible even before JSON logger
+    console.log(`[OR] Trying model: ${model}`);
     logger.info('OR trying model', { userId, model });
     try {
       const agent = getOrAgent(model);
       const text  = await agent.chat(orHistory, userText, userId);
       if (!text?.trim()) throw new Error(`${model} returned empty response`);
+      console.log(`[OR] Success: ${model}`);
       return { text, model };
     } catch (err) {
       const kind = classifyError(err);
+      console.log(`[OR] Failed: ${model} | ${kind} | ${err.message}`);
       logger.warn('OR model failed', { userId, model, kind, err: err.message });
       lastErr = err;
-      // continue to next model regardless of error type
     }
   }
 
