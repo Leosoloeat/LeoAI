@@ -9,8 +9,10 @@ const logger              = require('./logger');
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const GEMINI_MODEL      = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const GEMINI_TIMEOUT_MS = 25_000;
-const MAX_GEMINI_RETRY  = 3;
+// Budget: LINE reply token = 60s. Gemini worst case must stay under ~35s.
+// 2 retries × 12s + 1s backoff = 25s → leaves 35s for OpenRouter (20s) + buffer
+const GEMINI_TIMEOUT_MS = 12_000;
+const MAX_GEMINI_RETRY  = 2;
 
 // Scan ALL process.env keys matching OPENROUTER_MODEL or OPENROUTER_MODEL2…N
 // Sorted by numeric suffix so order is always MODEL(1st) → MODEL2 → MODEL3 …
@@ -252,32 +254,34 @@ async function generateReply(history, userText, userId) {
 
   const fullHistory = [...brainHistory, ...history];
 
-  // 1. Gemini (primary) — if success, return immediately, never touch OpenRouter
+  // 1. Gemini (primary) — success = return immediately, never touch OpenRouter
   console.log('[AI] Using Gemini');
   try {
     const result = await callGeminiWithRetry(fullHistory, userText, userId);
+    if (!result?.text?.trim()) throw new Error('Gemini returned empty text');
+    console.log(`[AI] Generated response (Gemini): "${result.text.slice(0, 60)}..."`);
     logger.info('Reply OK', { userId, model: result.model, latencyMs: Date.now() - start, tokenEst });
-    return result; // ← stop here
+    return result; // STOP — do not fall through
   } catch (err) {
-    console.log('[AI] Gemini failed → fallback OpenRouter');
+    console.log(`[AI] Gemini failed → fallback OpenRouter (${classifyError(err)})`);
     logger.warn('Gemini failed — switching to OpenRouter', {
       userId, kind: classifyError(err), err: err.message,
     });
   }
 
-  // 2. OpenRouter (max 2 models, sequential, stop on first success)
+  // 2. OpenRouter (max 2 models, sequential) — success = return immediately
   if (process.env.OPENROUTER_API_KEY && OPENROUTER_MODELS.length > 0) {
     try {
       const result = await callOpenRouter(fullHistory, userText, userId);
+      if (!result?.text?.trim()) throw new Error('OpenRouter returned empty text');
+      console.log(`[AI] Generated response (OpenRouter/${result.model}): "${result.text.slice(0, 60)}..."`);
       console.log('[AI] OpenRouter success');
       logger.info('Reply OK via OpenRouter', {
         userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
       });
-      return result; // ← stop here
+      return result; // STOP — do not fall through
     } catch (err) {
-      logger.error('OpenRouter candidates exhausted', {
-        userId, err: err.message,
-      });
+      logger.error('OpenRouter candidates exhausted', { userId, err: err.message });
     }
   }
 

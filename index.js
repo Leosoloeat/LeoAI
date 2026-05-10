@@ -82,12 +82,17 @@ function chunkForLine(text) {
 }
 
 async function safeReply(replyToken, texts) {
+  const preview = (texts[0] || '').slice(0, 60);
+  console.log(`[LINE] Sending reply: "${preview}..."`);
   try {
     await client.replyMessage({
       replyToken,
       messages: texts.slice(0, 5).map((text) => ({ type: 'text', text })),
     });
+    console.log('[LINE] Reply success');
+    logger.info('LINE reply sent', { chars: texts.join('').length });
   } catch (err) {
+    console.log(`[LINE] Reply failed: ${err.message}`);
     logger.error('LINE reply failed', { err: err.message });
   }
 }
@@ -203,12 +208,21 @@ async function handleEvent(event) {
   const session = getSession(userId);
   session.lastActive = Date.now();
 
+  let responseSent = false;
+
   try {
     const { text: raw } = await generateReply(session.history, msgText, userId);
 
-    if (!raw?.trim()) {
-      return safeReply(event.replyToken, ['ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ']);
+    if (!raw || typeof raw !== 'string' || !raw.trim()) {
+      if (!responseSent) {
+        responseSent = true;
+        return safeReply(event.replyToken, ['ขออภัยครับ ตอนนี้ตอบให้ไม่ได้ ลองถามอีกแบบได้ไหมครับ']);
+      }
+      return;
     }
+
+    if (responseSent) return;
+    responseSent = true;
 
     const cleaned = stripMarkdown(raw);
 

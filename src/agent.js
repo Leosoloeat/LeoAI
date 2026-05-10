@@ -4,7 +4,8 @@ const EventEmitter = require('eventemitter3');
 const logger       = require('./logger');
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const TIMEOUT_MS      = 30_000;
+// Keep under 20s: Gemini worst case 25s + OR 20s + buffer = 45s < 60s LINE token
+const TIMEOUT_MS      = 20_000;
 
 /**
  * OpenRouter Agent (fetch-based, CommonJS-safe)
