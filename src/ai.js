@@ -9,23 +9,40 @@ const logger              = require('./logger');
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const GEMINI_MODEL      = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-// Budget: LINE reply token = 60s. Gemini worst case must stay under ~35s.
-// 2 retries × 12s + 1s backoff = 25s → leaves 35s for OpenRouter (20s) + buffer
 const GEMINI_TIMEOUT_MS = 12_000;
 const MAX_GEMINI_RETRY  = 2;
 
-// Scan ALL process.env keys matching OPENROUTER_MODEL or OPENROUTER_MODEL2…N
-// Sorted by numeric suffix so order is always MODEL(1st) → MODEL2 → MODEL3 …
+/**
+ * Support two env var formats (deduplicated, order preserved):
+ *   1. OPENROUTER_MODELS=a,b,c           (comma-separated, plural)
+ *   2. OPENROUTER_MODEL=a  OPENROUTER_MODEL2=b  … (numbered, singular)
+ * Both formats may be mixed — result is merged and deduplicated.
+ */
 function loadOpenRouterModels() {
-  return Object.entries(process.env)
+  const seen   = new Set();
+  const result = [];
+
+  function add(val) {
+    const v = (val || '').trim();
+    if (v && !seen.has(v)) { seen.add(v); result.push(v); }
+  }
+
+  // Format 1: OPENROUTER_MODELS=a,b,c  (plural)
+  if (process.env.OPENROUTER_MODELS) {
+    process.env.OPENROUTER_MODELS.split(',').forEach((s) => add(s));
+  }
+
+  // Format 2: OPENROUTER_MODEL / OPENROUTER_MODEL2 … (numbered)
+  Object.entries(process.env)
     .filter(([key]) => /^OPENROUTER_MODEL\d*$/.test(key))
     .map(([key, val]) => ({
       order: key === 'OPENROUTER_MODEL' ? 0 : parseInt(key.slice('OPENROUTER_MODEL'.length), 10) || 0,
-      val:   (val || '').trim(),
+      val,
     }))
-    .filter(({ val }) => Boolean(val))
     .sort((a, b) => a.order - b.order)
-    .map(({ val }) => val);
+    .forEach(({ val }) => add(val));
+
+  return result;
 }
 
 const OPENROUTER_MODELS = loadOpenRouterModels();
@@ -55,23 +72,35 @@ function classifyError(err) {
   return 'UNKNOWN';
 }
 
-// ── Provider cooldown — prevent hammering failed models ───────────────────────
+// ── Per-model cooldown ────────────────────────────────────────────────────────
 
-const _cooldownMap = new Map(); // model -> cooldownUntil (ms)
+const _cooldownMap = new Map(); // model -> expiresAt (ms)
 
 const COOLDOWN_MS = {
-  NO_ENDPOINTS:  2 * 60_000,  // 2 min  — endpoint unavailable / 404
-  QUOTA:         5 * 60_000,  // 5 min  — 429 quota exhausted
-  AUTH:         60 * 60_000,  // 1 hr   — bad key (no point retrying)
-  UNAVAILABLE:   2 * 60_000,  // 2 min  — 502/503 transient
-  TIMEOUT:       1 * 60_000,  // 1 min  — network timeout
-  UNKNOWN:       2 * 60_000,  // 2 min  — unknown error
+  NO_ENDPOINTS: 10 * 60_000,  // 10 min — 404 / model not found
+  QUOTA:         1 * 60_000,  //  1 min — 429 rate limit
+  AUTH:         60 * 60_000,  //  1 hr  — bad key (no point retrying)
+  UNAVAILABLE:      30_000,   // 30 sec — temporary overload
+  TIMEOUT:          15_000,   // 15 sec — network timeout
+  UNKNOWN:       2 * 60_000,  //  2 min — unknown error
 };
 
+function _msToStr(ms) {
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 1_000)}s`;
+}
+
 function setCooldown(model, kind) {
-  const ms = COOLDOWN_MS[kind] || COOLDOWN_MS.UNKNOWN;
+  const ms = COOLDOWN_MS[kind] ?? COOLDOWN_MS.UNKNOWN;
   _cooldownMap.set(model, Date.now() + ms);
-  console.log(`[OR] Cooldown set: ${model} for ${Math.round(ms / 60_000)}m (${kind})`);
+  console.log(`[OR] cooldown set:\n  model=${model}\n  reason=${kind}\n  duration=${_msToStr(ms)}`);
+  logger.warn('OR cooldown set', { model, reason: kind, duration: _msToStr(ms) });
+}
+
+function clearCooldown(model) {
+  if (_cooldownMap.has(model)) {
+    _cooldownMap.delete(model);
+    console.log(`[OR] Cooldown cleared: ${model} (success)`);
+  }
 }
 
 function isOnCooldown(model) {
@@ -81,26 +110,38 @@ function isOnCooldown(model) {
   return true;
 }
 
-function cooldownRemainingMin(model) {
+function cooldownRemainingStr(model) {
   const until = _cooldownMap.get(model);
-  if (!until) return 0;
-  return Math.ceil((until - Date.now()) / 60_000);
+  if (!until) return '0s';
+  return _msToStr(Math.max(0, until - Date.now()));
 }
 
-// When ALL models are on cooldown, remove the one expiring soonest so at
-// least one attempt can be made — returns the cleared model name or null
-function clearOldestCooldown() {
-  if (_cooldownMap.size === 0) return null;
-  let oldest = null;
-  let oldestTime = Infinity;
-  for (const [model, until] of _cooldownMap) {
-    if (until < oldestTime) { oldestTime = until; oldest = model; }
-  }
-  if (oldest) {
-    _cooldownMap.delete(oldest);
-    console.log(`[OR] Auto-cleared oldest cooldown: ${oldest}`);
-  }
-  return oldest;
+// ── Per-model health scoring ──────────────────────────────────────────────────
+
+const _healthMap = new Map(); // model -> { wins, losses }
+
+function recordWin(model) {
+  const h = _healthMap.get(model) || { wins: 0, losses: 0 };
+  h.wins++;
+  _healthMap.set(model, h);
+}
+
+function recordLoss(model) {
+  const h = _healthMap.get(model) || { wins: 0, losses: 0 };
+  h.losses++;
+  _healthMap.set(model, h);
+}
+
+function healthScore(model) {
+  const h = _healthMap.get(model);
+  if (!h || h.wins + h.losses === 0) return 0.5;
+  return h.wins / (h.wins + h.losses);
+}
+
+// Permanently broken = 0 wins after ≥5 losses (skipped until process restart)
+function isPermanentlyBroken(model) {
+  const h = _healthMap.get(model);
+  return !!h && h.wins === 0 && h.losses >= 5;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -133,7 +174,7 @@ async function callGeminiWithRetry(history, userText, userId) {
       logger.warn('Gemini attempt failed', { userId, attempt, kind, err: err.message });
       if (kind === 'AUTH') break;
       if (attempt === MAX_GEMINI_RETRY) break;
-      await sleep(1_000 * Math.pow(2, attempt - 1)); // 1s → 2s → 4s
+      await sleep(1_000 * Math.pow(2, attempt - 1));
     }
   }
   throw lastErr;
@@ -167,7 +208,6 @@ function getOrAgent(model) {
   return agent;
 }
 
-// Try up to 2 models sequentially — stop immediately on first success
 async function callOpenRouter(history, userText, userId) {
   if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
   if (OPENROUTER_MODELS.length === 0)   throw new Error('No OPENROUTER_MODEL env vars set');
@@ -178,40 +218,47 @@ async function callOpenRouter(history, userText, userId) {
     content: h.parts[0]?.text || '',
   }));
 
-  // Cap at 2 models to prevent excessive fallback loops
-  const candidates = OPENROUTER_MODELS.slice(0, 2);
+  // Build candidates: skip cooldown + permanently broken, sort by health score descending
+  const candidates = OPENROUTER_MODELS.filter((m) => {
+    if (isPermanentlyBroken(m)) {
+      console.log(`[OR] Skip permanently broken: ${m}`);
+      return false;
+    }
+    if (isOnCooldown(m)) {
+      console.log(`[OR] Skip cooldown: ${m} (${cooldownRemainingStr(m)} remaining)`);
+      return false;
+    }
+    return true;
+  }).sort((a, b) => healthScore(b) - healthScore(a));
 
-  const activeModels   = candidates.filter((m) => !isOnCooldown(m));
-  const cooldownModels = candidates.filter((m) =>  isOnCooldown(m));
-  console.log(`[OR] Active models: ${activeModels.join(', ') || 'none'}`);
-  if (cooldownModels.length) {
-    console.log(`[OR] Cooldown models: ${cooldownModels.map((m) => `${m}(${cooldownRemainingMin(m)}m)`).join(', ')}`);
+  if (candidates.length === 0) {
+    throw new Error('All OpenRouter models on cooldown or permanently broken');
   }
+
+  console.log(`[OR] Candidates (${candidates.length}/${OPENROUTER_MODELS.length}): ${candidates.join(', ')}`);
 
   let lastErr;
 
   for (const model of candidates) {
-    if (isOnCooldown(model)) {
-      logger.info('OR skipped (cooldown)', { userId, model, remainingMin: cooldownRemainingMin(model) });
-      continue;
-    }
-
-    console.log(`[OR] Selected model: ${model}`);
-    logger.info('OR trying model', { userId, model });
+    console.log(`[OR] Trying: ${model} (score=${healthScore(model).toFixed(2)})`);
+    logger.info('OR trying model', { userId, model, score: healthScore(model).toFixed(2) });
 
     try {
       const agent = getOrAgent(model);
       const text  = await agent.chat(orHistory, userText, userId);
       if (!text?.trim()) throw new Error(`${model} returned empty response`);
-      // Stop here — do NOT continue to next model
+
+      recordWin(model);
+      clearCooldown(model);
+      console.log(`[OR] Success: ${model}`);
       return { text, model };
     } catch (err) {
       const kind = classifyError(err);
-      console.log(`[OR] Model failed: ${model} | ${kind} | ${err.message.slice(0, 120)}`);
+      console.log(`[OR] Failed: ${model} | ${kind} | ${err.message.slice(0, 120)}`);
       logger.warn('OR model failed', { userId, model, kind, err: err.message.slice(0, 200) });
+      recordLoss(model);
       setCooldown(model, kind);
       lastErr = err;
-      // continue to next candidate only if this one failed
     }
   }
 
@@ -229,10 +276,17 @@ function getSystemStatus() {
     },
     openrouter: {
       keySet: !!process.env.OPENROUTER_API_KEY,
-      models: OPENROUTER_MODELS.map((m) => ({
-        model:  m,
-        status: isOnCooldown(m) ? `cooldown ${cooldownRemainingMin(m)}m` : 'ready',
-      })),
+      models: OPENROUTER_MODELS.map((m) => {
+        const h      = _healthMap.get(m) || { wins: 0, losses: 0 };
+        const broken = isPermanentlyBroken(m);
+        return {
+          model:  m,
+          status: broken ? 'broken' : isOnCooldown(m) ? `cooldown ${cooldownRemainingStr(m)}` : 'ready',
+          score:  healthScore(m).toFixed(2),
+          wins:   h.wins,
+          losses: h.losses,
+        };
+      }),
     },
   };
 }
@@ -243,7 +297,6 @@ async function generateReply(history, userText, userId) {
   const start    = Date.now();
   const tokenEst = Math.ceil((userText.length + 50) / 4);
 
-  // Inject brain context (memory + tasks) as prepended history
   const brainCtx = buildBrainContext();
   const brainHistory = brainCtx
     ? [
@@ -254,14 +307,14 @@ async function generateReply(history, userText, userId) {
 
   const fullHistory = [...brainHistory, ...history];
 
-  // 1. Gemini (primary) — success = return immediately, never touch OpenRouter
+  // 1. Gemini (primary) — return immediately on success
   console.log('[AI] Using Gemini');
   try {
     const result = await callGeminiWithRetry(fullHistory, userText, userId);
     if (!result?.text?.trim()) throw new Error('Gemini returned empty text');
     console.log(`[AI] Generated response (Gemini): "${result.text.slice(0, 60)}..."`);
     logger.info('Reply OK', { userId, model: result.model, latencyMs: Date.now() - start, tokenEst });
-    return result; // STOP — do not fall through
+    return result;
   } catch (err) {
     console.log(`[AI] Gemini failed → fallback OpenRouter (${classifyError(err)})`);
     logger.warn('Gemini failed — switching to OpenRouter', {
@@ -269,7 +322,7 @@ async function generateReply(history, userText, userId) {
     });
   }
 
-  // 2. OpenRouter (max 2 models, sequential) — success = return immediately
+  // 2. OpenRouter (all available models, health-sorted) — return immediately on success
   if (process.env.OPENROUTER_API_KEY && OPENROUTER_MODELS.length > 0) {
     try {
       const result = await callOpenRouter(fullHistory, userText, userId);
@@ -279,13 +332,13 @@ async function generateReply(history, userText, userId) {
       logger.info('Reply OK via OpenRouter', {
         userId, model: result.model, latencyMs: Date.now() - start, tokenEst, fallback: true,
       });
-      return result; // STOP — do not fall through
+      return result;
     } catch (err) {
       logger.error('OpenRouter candidates exhausted', { userId, err: err.message });
     }
   }
 
-  // 3. Static fallback — only reached if ALL providers fail
+  // 3. Static fallback — only if ALL providers fail
   logger.error('All AI providers failed — static response', { userId, latencyMs: Date.now() - start });
   return {
     text:  'ขออภัยครับ ระบบ AI กำลังโหลดอยู่ ลองใหม่อีกครั้งใน 1-2 นาทีนะครับ 🙏',
