@@ -7,9 +7,10 @@ const { loadSkills }         = require('./skillRetriever');
 const { loadProjectContext } = require('./projectLoader');
 const logger                 = require('./logger');
 
-// Build system prompt from brain files (personality + skills + rules + style + forbidden)
-const SYSTEM_PROMPT = getSystemPrompt();
-console.log(`[AI] System prompt loaded from brain (${SYSTEM_PROMPT.length} chars)`);
+// System prompt is loaded lazily — getSystemPrompt() is called at request time,
+// not at module load time, so /reload immediately affects subsequent AI calls.
+// Log at startup to confirm brain files are readable.
+console.log(`[AI] System prompt ready (lazy) — brain chars: ${getSystemPrompt().length}`);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -80,10 +81,26 @@ console.log('[OR] Model count:', OPENROUTER_MODELS.length);
 // ── Gemini client ─────────────────────────────────────────────────────────────
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({
-  model:             GEMINI_MODEL,
-  systemInstruction: SYSTEM_PROMPT,
-});
+
+// Lazy model cache — rebuilt whenever the system prompt changes (e.g. after /reload).
+// getSystemPrompt() has its own 30-second TTL; after reloadBrain() clears the cache
+// the next call returns the freshly-loaded prompt and triggers a model rebuild here.
+let _geminiModelCache = null; // { prompt: string, model: GenerativeModel }
+
+function getGeminiModel() {
+  const prompt = getSystemPrompt();
+  if (!_geminiModelCache || _geminiModelCache.prompt !== prompt) {
+    _geminiModelCache = {
+      prompt,
+      model: genAI.getGenerativeModel({
+        model:             GEMINI_MODEL,
+        systemInstruction: prompt,
+      }),
+    };
+    console.log('[AI] Gemini model rebuilt (prompt changed)');
+  }
+  return _geminiModelCache.model;
+}
 
 // ── Error classification ──────────────────────────────────────────────────────
 
@@ -190,7 +207,7 @@ function sleep(ms) {
 
 // imageData: { mimeType: string, data: string (base64) } | null
 async function callGemini(history, userText, imageData = null, maxTokens = 1000) {
-  const chat    = geminiModel.startChat({
+  const chat    = getGeminiModel().startChat({
     history,
     generationConfig: { maxOutputTokens: maxTokens },
   });
@@ -230,6 +247,16 @@ async function callGeminiWithRetry(history, userText, userId, imageData = null, 
 
 const _orAgents = new Map();
 
+/**
+ * Clears all cached AI model instances so the next call rebuilds them with
+ * the freshly-loaded system prompt. Call this immediately after reloadBrain().
+ */
+function clearAgentCache() {
+  _orAgents.clear();
+  _geminiModelCache = null;
+  console.log('[AI] Agent cache cleared — next call will rebuild with fresh prompt');
+}
+
 function getOrAgent(model) {
   if (_orAgents.has(model)) return _orAgents.get(model);
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -238,7 +265,7 @@ function getOrAgent(model) {
   const agent = new Agent({
     apiKey,
     model,
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt: getSystemPrompt(), // always read current prompt, not module-load snapshot
     siteUrl:      'https://leoai-production.up.railway.app',
     siteName:     'Leo AI LINE OA',
   });
@@ -559,6 +586,7 @@ async function generateReply(history, userText, userId, forceModel = null, route
 module.exports = {
   generateReply,
   getSystemStatus,
+  clearAgentCache,
   GEMINI_MODEL,
   OPENROUTER_MODEL,
   OPENROUTER_MODELS,

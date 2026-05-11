@@ -13,6 +13,7 @@ const {
 const {
   generateReply,
   getSystemStatus,
+  clearAgentCache,
   GEMINI_MODEL,
   OPENROUTER_MODELS,
 } = require('./src/ai');
@@ -83,7 +84,15 @@ const sessions = new Map();
 
 setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
-  for (const [k, v] of sessions) if (v.lastActive < cutoff) sessions.delete(k);
+  let pruned = 0;
+  for (const [k, v] of sessions) {
+    if (v.lastActive < cutoff) {
+      sessions.delete(k);
+      userModelPrefs.delete(k);
+      pruned++;
+    }
+  }
+  if (pruned > 0) console.log(`[cleanup] Pruned ${pruned} stale session(s) and model pref(s)`);
 }, 5 * 60_000).unref();
 
 // ── Image download ─────────────────────────────────────────────────────────────
@@ -314,6 +323,7 @@ async function handleCommand(text, replyToken, userId) {
 
     case '/reload': {
       const b = reloadBrain();
+      clearAgentCache(); // wipe Gemini model + OR agent instances so they rebuild with fresh prompt
       const loaded = Object.entries(b).filter(([, v]) => v).map(([k]) => k).join(', ');
       return safeReply(replyToken, [`Brain reloaded\nFiles: ${loaded}`]);
     }
