@@ -75,10 +75,8 @@ const client = new messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// Blob client for downloading image/audio/video content from LINE servers
-const blobClient = new messagingApi.MessagingApiBlobClient({
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-});
+// LINE Content API base — used for direct image download (bypasses SDK stream issues)
+const LINE_CONTENT_API = 'https://api-data.line.me/v2/bot/message';
 
 // ── Session store ──────────────────────────────────────────────────────────────
 const sessions = new Map();
@@ -91,13 +89,13 @@ setInterval(() => {
 // ── Image download ─────────────────────────────────────────────────────────────
 
 async function downloadLineImage(messageId) {
-  const stream = await blobClient.getMessageContent(messageId);
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const buffer = Buffer.concat(chunks);
-  return { mimeType: 'image/jpeg', data: buffer.toString('base64') };
+  const res = await fetch(`${LINE_CONTENT_API}/${messageId}/content`, {
+    headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`LINE content API ${res.status}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const mimeType = res.headers.get('content-type') || 'image/jpeg';
+  return { mimeType, data: buffer.toString('base64') };
 }
 
 // ── Image event handler ────────────────────────────────────────────────────────
