@@ -5,8 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
-    "tunnel": "ngrok http 3000"
+    "dev": "node --use-system-ca --watch index.js",
+    "tunnel": "ngrok http 3000",
+    "test:sheets": "node --use-system-ca -e \"require('dotenv').config(); require('./src/sheets').pingSheets().then(ok => console.log('Sheets:', ok ? 'ONLINE' : 'OFFLINE'));\""
   },
   "engines": {
     "node": ">=20"
@@ -18,6 +19,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@line/bot-sdk": "^11.0.0",
+    "@tavily/core": "^0.7.3",
     "dotenv": "^17.4.2",
     "eventemitter3": "^5.0.4",
     "express": "^5.2.1"

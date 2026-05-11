@@ -39,6 +39,11 @@ function loadBrain(force = false) {
 
 function reloadBrain() {
   _cache = null;
+  // Also clear skill + project caches so /reload refreshes everything
+  try {
+    require('./skillRetriever').clearSkillCache();
+    require('./projectLoader').clearProjectCache();
+  } catch { /* modules may not be loaded yet on first boot */ }
   return loadBrain(true);
 }
 
@@ -74,18 +79,14 @@ function appendMemory(entry, userId = 'system') {
   const file = path.join(BRAIN_DIR, 'memory.md');
   const ts   = new Date().toISOString().replace('T', ' ').slice(0, 16);
 
-  // 1. Write to local file (always, synchronous)
+  // Write to local file only — Sheets persistence is handled by the caller
   try {
     fs.appendFileSync(file, `\n- [${ts}] ${entry}`, 'utf8');
     _cache = null;
-    console.log(`[brain] Memory updated: "${entry}"`);
+    console.log(`[brain] Memory updated: "${entry.slice(0, 60)}"`);
   } catch (e) {
     console.warn('[brain] appendMemory failed:', e.message);
   }
-
-  // 2. Fire-and-forget to Google Sheets (never blocks LINE reply)
-  const { saveMemoryToSheets } = require('./sheets');
-  saveMemoryToSheets(userId, entry, '/remember').catch(() => {});
 }
 
 function updateTasks(content) {

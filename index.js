@@ -17,7 +17,27 @@ const {
   OPENROUTER_MODELS,
 } = require('./src/ai');
 const { loadBrain, reloadBrain, appendMemory } = require('./src/brain');
-const { loadMemoryFromSheets, pingSheets }     = require('./src/sheets');
+const {
+  saveMemory,
+  getMemory,
+  searchMemory,
+  forgetMemory,
+  pingSheets,
+  getScriptUrl,
+  loadMemoryFromSheets,
+  saveKnowledge,
+  getKnowledge,
+} = require('./src/sheets');
+const {
+  searchWeb,
+  detectSearchIntent,
+  buildSearchContext,
+  formatSearchResults,
+} = require('./src/search');
+const { route }                           = require('./src/router');
+const { listSkills }                      = require('./src/skillRetriever');
+const { listProjects }                    = require('./src/projectLoader');
+const { scoreKnowledge, buildKnowledgeEntry } = require('./src/knowledgeExtractor');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -122,8 +142,11 @@ async function handleCommand(text, replyToken, userId) {
       const orLines = s.openrouter.models.length
         ? s.openrouter.models.map((m) => `• ${m.model}: ${m.status}`).join('\n')
         : '• ไม่มี model';
+      const skillList    = listSkills();
+      const projectList  = listProjects();
+      const sheetsOk     = !!getScriptUrl();
       const reply = [
-        `Leo AI System Health`,
+        `Leo AI OS — System Health`,
         `Uptime: ${s.uptime}s | Sessions: ${sessions.size}`,
         ``,
         `Gemini: ${s.gemini.model}`,
@@ -131,6 +154,14 @@ async function handleCommand(text, replyToken, userId) {
         ``,
         `OpenRouter: ${s.openrouter.keySet ? 'OK' : 'MISSING'}`,
         orLines,
+        ``,
+        `Web Search: ${process.env.TAVILY_API_KEY ? 'OK' : 'MISSING'}`,
+        `Google Sheets: ${sheetsOk ? 'OK' : 'MISSING — ใส่ GOOGLE_SHEETS_WEBHOOK'}`,
+        ``,
+        `Skills (${skillList.length}): ${skillList.join(', ')}`,
+        `Projects (${projectList.length}): ${projectList.join(', ')}`,
+        ``,
+        `Commands: /skills /knowledge /remember /memory /search /news /model /use`,
       ].join('\n');
       return safeReply(replyToken, [reply]);
     }
@@ -185,41 +216,93 @@ async function handleCommand(text, replyToken, userId) {
     }
 
     case '/sheetstatus': {
-      const url = process.env.GOOGLE_SCRIPT_URL;
-      if (!url) return safeReply(replyToken, ['GOOGLE_SCRIPT_URL ยังไม่ได้ตั้งค่าครับ']);
+      const sheetUrl = getScriptUrl();
+      if (!sheetUrl) {
+        return safeReply(replyToken, [
+          'ยังไม่ได้ตั้งค่า Google Sheets ครับ\nเพิ่ม GOOGLE_SHEETS_WEBHOOK ใน Railway env',
+        ]);
+      }
       const alive = await pingSheets();
-      const lines = [
+      return safeReply(replyToken, [
         `Google Sheets: ${alive ? 'Online' : 'Offline'}`,
-        `URL: ${url.slice(0, 60)}...`,
-      ];
-      return safeReply(replyToken, [lines.join('\n')]);
+        `URL: ${sheetUrl.slice(0, 70)}...`,
+        ``,
+        `Commands: /remember /memory /forget`,
+      ].join('\n'));
     }
 
     case '/remember': {
-      if (!args) return safeReply(replyToken, ['ใส่ข้อความที่จะจำด้วยครับ เช่น /remember ลูกค้าชอบราคาถูก']);
-      appendMemory(`[${userId.slice(-6)}] ${args}`, userId);
-      const sheetsNote = process.env.GOOGLE_SCRIPT_URL ? ' (บันทึก Sheets ด้วย)' : '';
-      return safeReply(replyToken, [`จำไว้แล้วครับ: "${args}"${sheetsNote}`]);
+      if (!args) {
+        return safeReply(replyToken, [
+          'รูปแบบการใช้:\n/remember ข้อความ\n/remember key: ข้อความ\n\nตัวอย่าง:\n/remember ลูกค้าชอบราคาถูก\n/remember ลูกค้า: คุณสมชาย ชอบสินค้า premium',
+        ]);
+      }
+
+      // Parse optional "key: value" format
+      const colonIdx = args.indexOf(':');
+      let memKey, memValue;
+      if (colonIdx > 0 && colonIdx < 30) {
+        memKey   = args.slice(0, colonIdx).trim().toLowerCase().replace(/\s+/g, '_');
+        memValue = args.slice(colonIdx + 1).trim();
+      } else {
+        memKey   = 'note';
+        memValue = args;
+      }
+
+      // 1. Write to local brain file (immediate, session-visible)
+      appendMemory(`[${memKey}] ${memValue}`, userId);
+
+      // 2. Save to Sheets (persistent, survives restart)
+      const saveResult = await saveMemory(userId, memKey, memValue, '/remember');
+      const dest       = saveResult.ok
+        ? 'บันทึก Sheets สำเร็จครับ'
+        : `บันทึก local สำเร็จ (Sheets: ${saveResult.reason})`;
+
+      return safeReply(replyToken, [
+        `จำไว้แล้วครับ\nkey: ${memKey}\nvalue: ${memValue}\n\n${dest}`,
+      ]);
     }
 
     case '/memory': {
-      if (!process.env.GOOGLE_SCRIPT_URL) {
-        const b = loadBrain();
-        return safeReply(replyToken, [`Memory (local)\n\n${b.memory || '(ยังไม่มี memory)'}`]);
+      const { ok: mOk, rows: mRows, fromRam } = await getMemory(userId, 15);
+
+      if (!mOk || mRows.length === 0) {
+        return safeReply(replyToken, [
+          'ยังไม่มี memory ของคุณครับ\nใช้ /remember เพื่อบันทึก',
+        ]);
       }
-      const { ok, rows, reason } = await loadMemoryFromSheets(15);
-      if (!ok) {
-        return safeReply(replyToken, [`โหลด Sheets ไม่ได้ครับ (${reason})\nลอง /brain เพื่อดู local memory`]);
-      }
-      if (rows.length === 0) {
-        return safeReply(replyToken, ['ยังไม่มี memory ใน Google Sheets ครับ\nใช้ /remember เพื่อเพิ่ม']);
-      }
+
+      const src   = fromRam ? ' (RAM)' : ' (Sheets)';
       const lines = [
-        `Memory (${rows.length} รายการล่าสุด)`,
+        `Memory ของคุณ (${mRows.length} รายการ)${src}`,
         '',
-        ...rows.map((r) => `• ${String(r.timestamp).slice(0, 16)} — ${r.memory}`),
+        ...mRows.map((r) => {
+          const ts  = String(r.timestamp).slice(0, 16);
+          const mem = String(r.memory).slice(0, 80);
+          return `• ${ts} — ${mem}`;
+        }),
+        '',
+        'ใช้ /forget <key> เพื่อลบ',
       ];
       return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/forget': {
+      if (!args) {
+        return safeReply(replyToken, [
+          'ระบุ key ที่จะลบด้วยครับ\nเช่น /forget note\n\nดู key ได้จาก /memory',
+        ]);
+      }
+      const { ok: fOk, deleted, reason: fReason, deletedFromRam } = await forgetMemory(userId, args.trim());
+      if (fOk) {
+        return safeReply(replyToken, [
+          deleted === 0
+            ? `ไม่พบ memory ที่มี key "${args}" ครับ\nดู key ได้จาก /memory`
+            : `ลบแล้วครับ\nkey: ${args}\nลบออก ${deleted} รายการจาก Sheets`,
+        ]);
+      }
+      const ramMsg = deletedFromRam > 0 ? ` (ลบ RAM ${deletedFromRam} รายการ)` : '';
+      return safeReply(replyToken, [`Sheets ไม่ตอบสนองครับ (${fReason})${ramMsg}`]);
     }
 
     case '/use': {
@@ -249,6 +332,66 @@ async function handleCommand(text, replyToken, userId) {
         ``,
         `ใช้ /use auto เพื่อกลับสู่ auto mode`,
       ].join('\n'));
+    }
+
+    case '/skills': {
+      const available = listSkills();
+      const projects  = listProjects();
+      const lines = [
+        `Leo AI — Skill Library`,
+        ``,
+        `Skills (${available.length}):`,
+        ...available.map((s) => `• ${s}`),
+        ``,
+        `Projects (${projects.length}):`,
+        ...projects.map((p) => `• ${p}`),
+        ``,
+        `Router โหลดเฉพาะ skills ที่เกี่ยวข้อง — ไม่โหลดทั้งหมด`,
+      ];
+      return safeReply(replyToken, [lines.join('\n')]);
+    }
+
+    case '/knowledge': {
+      const kLimit = 8;
+      const { ok: kOk, rows: kRows } = await getKnowledge(null, kLimit);
+      if (!kOk || kRows.length === 0) {
+        return safeReply(replyToken, [
+          'ยังไม่มี knowledge ที่บันทึกอัตโนมัติครับ\nระบบจะบันทึกเมื่อ AI ตอบด้วย knowledge ที่มีคุณค่า',
+        ]);
+      }
+      const lines = [
+        `Knowledge Base (${kRows.length} รายการล่าสุด)`,
+        '',
+        ...kRows.map((r) => {
+          const ts    = String(r.timestamp || '').slice(0, 16);
+          const title = String(r.title || r.type || '').slice(0, 60);
+          const score = r.score || '?';
+          return `• [${r.type || '?'}] ${title}\n  score:${score} | ${ts}`;
+        }),
+        '',
+        'บันทึกอัตโนมัติเมื่อ score >= 3',
+      ];
+      return safeReply(replyToken, [lines.join('\n').slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/search': {
+      if (!args) return safeReply(replyToken, ['ใส่คำค้นหาด้วยครับ เช่น /search ราคาทอง วันนี้']);
+      if (!process.env.TAVILY_API_KEY) {
+        return safeReply(replyToken, ['ยังไม่ได้ตั้งค่า TAVILY_API_KEY ครับ\nสมัครที่ tavily.com แล้วใส่ใน Railway env']);
+      }
+      const sr  = await searchWeb(args);
+      const out = formatSearchResults(args, sr, false);
+      return safeReply(replyToken, [out.slice(0, LINE_MAX_TEXT)]);
+    }
+
+    case '/news': {
+      const topic = args || 'Thailand news today';
+      if (!process.env.TAVILY_API_KEY) {
+        return safeReply(replyToken, ['ยังไม่ได้ตั้งค่า TAVILY_API_KEY ครับ\nสมัครที่ tavily.com แล้วใส่ใน Railway env']);
+      }
+      const nr  = await searchWeb(topic, { news: true });
+      const out = formatSearchResults(topic, nr, true);
+      return safeReply(replyToken, [out.slice(0, LINE_MAX_TEXT)]);
     }
 
     default:
@@ -298,8 +441,36 @@ async function handleEvent(event) {
   let responseSent = false;
   const forceModel = userModelPrefs.get(userId) || null;
 
+  // ── Router: analyze intent — select skills + project ──────────────────────
+  const routeInfo = route(msgText);
+  if (routeInfo.skills.length > 0 || routeInfo.project) {
+    console.log(`[router] skills=[${routeInfo.skills.join(',')}] project=${routeInfo.project || 'none'} score=${routeInfo.knowledgeScore}`);
+    logger.info('Router decision', { userId, skills: routeInfo.skills, project: routeInfo.project });
+  }
+
   try {
-    const { text: raw } = await generateReply(session.history, msgText, userId, forceModel);
+    // ── Auto web search: inject real-time data when query needs it ─────────────
+    let historyForAI = session.history;
+
+    if (process.env.TAVILY_API_KEY && detectSearchIntent(msgText)) {
+      console.log(`[search] Auto-triggered for: "${msgText.slice(0, 60)}"`);
+      logger.info('Auto search triggered', { userId, query: msgText.slice(0, 60) });
+
+      const isNews = /ข่าว|news|breaking|สถานการณ์|ล่าสุด/i.test(msgText);
+      const sr     = await searchWeb(msgText, { news: isNews });
+
+      if (sr.ok && sr.results.length > 0) {
+        const ctx = buildSearchContext(msgText, sr);
+        historyForAI = [
+          ...session.history,
+          { role: 'user',  parts: [{ text: ctx }] },
+          { role: 'model', parts: [{ text: 'รับทราบข้อมูลจาก web search ครับ จะนำมาตอบคำถามนี้' }] },
+        ];
+        logger.info('Search context injected', { userId, hits: sr.results.length });
+      }
+    }
+
+    const { text: raw } = await generateReply(historyForAI, msgText, userId, forceModel, routeInfo);
 
     if (!raw || typeof raw !== 'string' || !raw.trim()) {
       if (!responseSent) {
@@ -320,6 +491,24 @@ async function handleEvent(event) {
     );
     if (session.history.length > MAX_HISTORY_ENTRIES) {
       session.history.splice(0, session.history.length - MAX_HISTORY_ENTRIES);
+    }
+
+    // ── Auto knowledge capture (non-blocking, fire-and-forget) ─────────────
+    const { score, type, shouldSave } = scoreKnowledge(msgText, cleaned, routeInfo.skills);
+    if (shouldSave && getScriptUrl()) {
+      const entry = buildKnowledgeEntry({
+        userId,
+        userText: msgText,
+        aiText:   cleaned,
+        skills:   routeInfo.skills,
+        project:  routeInfo.project,
+        score,
+        type,
+      });
+      // Fire and forget — never delay the reply
+      saveKnowledge(entry).catch((e) =>
+        logger.error('Auto knowledge save error', { err: e.message }),
+      );
     }
 
     return safeReply(event.replyToken, chunkForLine(cleaned));

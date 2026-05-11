@@ -3,6 +3,8 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { Agent }              = require('./agent');
 const { getSystemPrompt, buildBrainContext } = require('./brain');
+const { loadSkills }         = require('./skillRetriever');
+const { loadProjectContext } = require('./projectLoader');
 const logger                 = require('./logger');
 
 // Build system prompt from brain files (personality + skills + rules + style + forbidden)
@@ -349,15 +351,45 @@ let _orExhaustedUntil = 0;
 
 // ── Main: Gemini → OpenRouter chain → static fallback ─────────────────────────
 
-async function generateReply(history, userText, userId, forceModel = null) {
+/**
+ * Main reply generator.
+ *
+ * @param {Array}       history    - Session conversation history
+ * @param {string}      userText   - User message
+ * @param {string}      userId     - LINE userId
+ * @param {string|null} forceModel - Forced model override
+ * @param {object|null} routeInfo  - { skills, project } from router (optional)
+ */
+async function generateReply(history, userText, userId, forceModel = null, routeInfo = null) {
   const start    = Date.now();
   const tokenEst = Math.ceil((userText.length + 50) / 4);
 
+  // ── Build dynamic context from routing info ──────────────────────────────────
+  const contextParts = [];
+
+  // 1. Brain context (memory + tasks) — always injected
   const brainCtx = buildBrainContext();
-  const brainHistory = brainCtx
+  if (brainCtx) contextParts.push(brainCtx);
+
+  // 2. Skill context — only load relevant skills (never all at once)
+  if (routeInfo?.skills?.length > 0) {
+    const skillCtx = loadSkills(routeInfo.skills);
+    if (skillCtx) contextParts.push(skillCtx);
+    console.log(`[AI] Skills loaded: ${routeInfo.skills.join(', ')}`);
+  }
+
+  // 3. Project context — load matching project + shared knowledge
+  if (routeInfo?.project) {
+    const projectCtx = loadProjectContext(routeInfo.project);
+    if (projectCtx) contextParts.push(projectCtx);
+    console.log(`[AI] Project loaded: ${routeInfo.project}`);
+  }
+
+  const combinedCtx = contextParts.join('\n\n');
+  const brainHistory = combinedCtx
     ? [
-        { role: 'user',  parts: [{ text: `[CONTEXT]\n${brainCtx}` }] },
-        { role: 'model', parts: [{ text: 'รับทราบ context ปัจจุบันครับ' }] },
+        { role: 'user',  parts: [{ text: `[CONTEXT]\n${combinedCtx}` }] },
+        { role: 'model', parts: [{ text: 'รับทราบ context ครับ' }] },
       ]
     : [];
 
