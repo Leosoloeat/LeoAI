@@ -60,6 +60,12 @@ function loadOpenRouterModels() {
 const OPENROUTER_MODELS = loadOpenRouterModels();
 const OPENROUTER_MODEL  = OPENROUTER_MODELS[0] || 'none';
 
+// ── Role models for smart pre-routing ─────────────────────────────────────────
+// These are tried FIRST for matching intent before falling to the general chain.
+// Set in .env — omit to disable that role's pre-routing (falls back to Gemini).
+const REASONING_MODEL = process.env.OPENROUTER_REASONING_MODEL || ''; // claude-haiku
+const CODE_MODEL      = process.env.OPENROUTER_CODE_MODEL      || (OPENROUTER_MODELS[0] || '');
+
 // Startup validation — catch any entry that still contains a comma
 OPENROUTER_MODELS.forEach((m) => {
   if (m.includes(',')) {
@@ -183,9 +189,12 @@ function sleep(ms) {
 // ── Gemini ────────────────────────────────────────────────────────────────────
 
 // imageData: { mimeType: string, data: string (base64) } | null
-async function callGemini(history, userText, imageData = null) {
-  const chat    = geminiModel.startChat({ history });
-  const timeout = imageData ? 25_000 : GEMINI_TIMEOUT_MS; // vision needs more time
+async function callGemini(history, userText, imageData = null, maxTokens = 1000) {
+  const chat    = geminiModel.startChat({
+    history,
+    generationConfig: { maxOutputTokens: maxTokens },
+  });
+  const timeout = imageData ? 25_000 : GEMINI_TIMEOUT_MS;
 
   const message = imageData
     ? [{ text: userText }, { inlineData: imageData }]
@@ -199,11 +208,11 @@ async function callGemini(history, userText, imageData = null) {
   ]);
 }
 
-async function callGeminiWithRetry(history, userText, userId, imageData = null) {
+async function callGeminiWithRetry(history, userText, userId, imageData = null, maxTokens = 1000) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_GEMINI_RETRY; attempt++) {
     try {
-      const text = await callGemini(history, userText, imageData);
+      const text = await callGemini(history, userText, imageData, maxTokens);
       return { text, model: GEMINI_MODEL };
     } catch (err) {
       lastErr = err;
@@ -245,7 +254,7 @@ function getOrAgent(model) {
   return agent;
 }
 
-async function callOpenRouter(history, userText, userId) {
+async function callOpenRouter(history, userText, userId, maxTokens = 1000) {
   if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
   if (OPENROUTER_MODELS.length === 0)   throw new Error('No OPENROUTER_MODEL env vars set');
 
@@ -282,7 +291,7 @@ async function callOpenRouter(history, userText, userId) {
 
     try {
       const agent = getOrAgent(model);
-      const text  = await agent.chat(orHistory, userText, userId);
+      const text  = await agent.chat(orHistory, userText, userId, maxTokens);
       if (!text?.trim()) throw new Error(`${model} returned empty response`);
 
       recordWin(model);
@@ -305,7 +314,7 @@ async function callOpenRouter(history, userText, userId) {
 
 // ── Force a single specific OR model (ignores cooldown — user chose it) ────────
 
-async function callSingleOrModel(history, userText, userId, model) {
+async function callSingleOrModel(history, userText, userId, model, maxTokens = 1000) {
   if (!process.env.OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
 
   const orHistory = history.map((h) => ({
@@ -315,13 +324,34 @@ async function callSingleOrModel(history, userText, userId, model) {
 
   console.log(`[OR] Force model: ${model}`);
   const agent = getOrAgent(model);
-  const text  = await agent.chat(orHistory, userText, userId);
+  const text  = await agent.chat(orHistory, userText, userId, maxTokens);
   if (!text?.trim()) throw new Error(`${model} returned empty response`);
 
   recordWin(model);
   clearCooldown(model);
   console.log(`[OR] Force success: ${model} (${text.length} chars)`);
   return { text, model };
+}
+
+// ── Smart pre-routing: try a role model first, respects cooldown ───────────────
+
+async function callSpecificModel(history, userText, userId, model, maxTokens = 1000) {
+  if (!model || !process.env.OPENROUTER_API_KEY) return null;
+  if (isOnCooldown(model) || isPermanentlyBroken(model)) {
+    console.log(`[OR] Pre-route skip (cooldown/broken): ${model}`);
+    return null;
+  }
+  try {
+    const result = await callSingleOrModel(history, userText, userId, model, maxTokens);
+    logger.info('Pre-route success', { userId, model, chars: result.text.length });
+    return result;
+  } catch (err) {
+    const kind = classifyError(err);
+    recordLoss(model);
+    setCooldown(model, kind);
+    logger.warn('Pre-route failed', { userId, model, kind });
+    return null;
+  }
 }
 
 // ── System status (for /debug and /health commands) ───────────────────────────
@@ -369,8 +399,10 @@ let _orExhaustedUntil = 0;
  * @param {object|null} imageData  - { mimeType, data (base64) } — vision input (optional)
  */
 async function generateReply(history, userText, userId, forceModel = null, routeInfo = null, imageData = null) {
-  const start    = Date.now();
-  const tokenEst = Math.ceil((userText.length + 50) / 4);
+  const start     = Date.now();
+  const tokenEst  = Math.ceil((userText.length + 50) / 4);
+  // Skills active → use 2000 tokens; plain chat → 1000
+  const maxTokens = (routeInfo?.skills?.length > 0) ? 2000 : 1000;
 
   // ── Build dynamic context from routing info ──────────────────────────────────
   const contextParts = [];
@@ -407,7 +439,7 @@ async function generateReply(history, userText, userId, forceModel = null, route
   if (imageData) {
     console.log('[AI] Vision mode — forcing Gemini');
     try {
-      const result = await callGeminiWithRetry(fullHistory, userText, userId, imageData);
+      const result = await callGeminiWithRetry(fullHistory, userText, userId, imageData, 2000);
       if (!result?.text?.trim()) throw new Error('empty vision response');
       logger.info('Vision reply OK', { userId, latencyMs: Date.now() - start });
       return result;
@@ -421,7 +453,7 @@ async function generateReply(history, userText, userId, forceModel = null, route
   if (forceModel === 'gemini') {
     console.log('[AI] Forced: Gemini');
     try {
-      const result = await callGeminiWithRetry(fullHistory, userText, userId);
+      const result = await callGeminiWithRetry(fullHistory, userText, userId, null, maxTokens);
       if (!result?.text?.trim()) throw new Error('empty');
       logger.info('Reply OK (forced gemini)', { userId, latencyMs: Date.now() - start });
       return result;
@@ -438,7 +470,7 @@ async function generateReply(history, userText, userId, forceModel = null, route
   if (forceModel && forceModel !== 'auto') {
     console.log(`[AI] Forced: ${forceModel}`);
     try {
-      const result = await callSingleOrModel(fullHistory, userText, userId, forceModel);
+      const result = await callSingleOrModel(fullHistory, userText, userId, forceModel, maxTokens);
       logger.info('Reply OK (forced OR)', { userId, model: forceModel, latencyMs: Date.now() - start });
       return result;
     } catch (err) {
@@ -449,12 +481,35 @@ async function generateReply(history, userText, userId, forceModel = null, route
     }
   }
 
+  // ── SMART PRE-ROUTING — role model first for matching intents ─────────────────
+  const preferredModel = routeInfo?.preferredModel;
+
+  if (preferredModel === 'deepseek' && CODE_MODEL) {
+    console.log(`[AI] Pre-route → DeepSeek (${CODE_MODEL})`);
+    const result = await callSpecificModel(fullHistory, userText, userId, CODE_MODEL, maxTokens);
+    if (result?.text?.trim()) {
+      logger.info('Reply OK (pre-route deepseek)', { userId, model: CODE_MODEL, latencyMs: Date.now() - start });
+      return result;
+    }
+    console.log('[AI] DeepSeek pre-route failed — falling to Gemini');
+  }
+
+  if (preferredModel === 'claude-haiku' && REASONING_MODEL) {
+    console.log(`[AI] Pre-route → Claude Haiku (${REASONING_MODEL})`);
+    const result = await callSpecificModel(fullHistory, userText, userId, REASONING_MODEL, maxTokens);
+    if (result?.text?.trim()) {
+      logger.info('Reply OK (pre-route claude-haiku)', { userId, model: REASONING_MODEL, latencyMs: Date.now() - start });
+      return result;
+    }
+    console.log('[AI] Claude Haiku pre-route failed — falling to Gemini');
+  }
+
   // ── AUTO ROUTING ─────────────────────────────────────────────────────────────
 
   // 1. Gemini (primary) — return immediately on success
   console.log('[AI] Using Gemini');
   try {
-    const result = await callGeminiWithRetry(fullHistory, userText, userId);
+    const result = await callGeminiWithRetry(fullHistory, userText, userId, null, maxTokens);
     if (!result?.text?.trim()) throw new Error('Gemini returned empty text');
     console.log(`[AI] Generated response (Gemini): "${result.text.slice(0, 60)}..."`);
     logger.info('Reply OK', { userId, model: result.model, latencyMs: Date.now() - start, tokenEst });
@@ -473,7 +528,7 @@ async function generateReply(history, userText, userId, forceModel = null, route
       console.log(`[OR] Skip — all failed recently (${Math.ceil(orSkipRemaining / 1_000)}s cache)`);
     } else {
       try {
-        const result = await callOpenRouter(fullHistory, userText, userId);
+        const result = await callOpenRouter(fullHistory, userText, userId, maxTokens);
         if (!result?.text?.trim()) throw new Error('OpenRouter returned empty text');
         _orExhaustedUntil = 0;
         console.log(`[AI] Generated response (OpenRouter/${result.model}): "${result.text.slice(0, 60)}..."`);

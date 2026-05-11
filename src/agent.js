@@ -89,7 +89,7 @@ class Agent extends EventEmitter {
    * @param {string}                [userId]
    * @returns {Promise<string>}
    */
-  async chat(history, userText, userId = 'anon') {
+  async chat(history, userText, userId = 'anon', maxTokens = 1000) {
     this.emit('thinking:start', { userId, model: this.model });
 
     const messages = [
@@ -102,7 +102,7 @@ class Agent extends EventEmitter {
     const reqBody  = {
       model:       this.model,
       messages,
-      max_tokens:  1000,
+      max_tokens:  maxTokens,
       temperature: 0.7,
       ...(toolDefs.length ? { tools: toolDefs, tool_choice: 'auto' } : {}),
     };
@@ -144,7 +144,7 @@ class Agent extends EventEmitter {
       const final = await this._post({
         model:    this.model,
         messages: [...messages, ...toolMessages],
-        max_tokens:  1000,
+        max_tokens:  maxTokens,
         temperature: 0.7,
       });
 

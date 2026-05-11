@@ -136,7 +136,19 @@ function route(text) {
     if (text.length > 500)    knowledgeScore++;
   }
 
-  return { skills, project, knowledgeScore, isLowValue };
+  // ── Preferred model based on skill intent ─────────────────────────────────
+  // deepseek   → code, structured output, technical debugging
+  // claude-haiku → multi-step reasoning, complex business analysis
+  // gemini     → everything else (fast, vision, general Q&A)
+  let preferredModel = 'gemini';
+
+  if (skills.some((s) => ['coding', 'ai_agent', 'prompt_engineering'].includes(s))) {
+    preferredModel = 'deepseek';
+  } else if (skills.some((s) => ['analyze_funnel', 'financial_breakdown', 'analyze_competitor'].includes(s))) {
+    preferredModel = 'claude-haiku';
+  }
+
+  return { skills, project, knowledgeScore, isLowValue, preferredModel };
 }
 
 module.exports = { route };
