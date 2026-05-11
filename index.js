@@ -125,6 +125,15 @@ function stripMarkdown(text) {
     .replace(/^\s*[-*]\s+/gm, '• ');
 }
 
+// Post-processing: strip consultant/sales closing phrases that leak through despite prompt rules
+function sanitizeOutput(text) {
+  return text
+    .replace(/^.*(?:นัดคุย|นัด\s*\d+\s*นาที|schedule\s+a\s+call|โทรคุย|ให้ทีมติดต่อ|contact\s+us|ติดต่อเรา).*$/gim, '')
+    .replace(/^.*(?:อยากให้อธิบายเพิ่ม|ทักมาได้เลย|มีคำถามทักได้เลย|ยินดีให้คำปรึกษา|ปรึกษาได้เสมอ).*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n') // collapse extra blank lines left by removed sentences
+    .trim();
+}
+
 function chunkForLine(text) {
   const chunks = [];
   let rest = text.trim();
@@ -508,7 +517,7 @@ async function handleEvent(event) {
     if (responseSent) return;
     responseSent = true;
 
-    const cleaned = stripMarkdown(raw);
+    const cleaned = sanitizeOutput(stripMarkdown(raw));
 
     session.history.push(
       { role: 'user',  parts: [{ text: msgText }] },
