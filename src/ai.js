@@ -182,21 +182,28 @@ function sleep(ms) {
 
 // ── Gemini ────────────────────────────────────────────────────────────────────
 
-async function callGemini(history, userText) {
-  const chat = geminiModel.startChat({ history });
+// imageData: { mimeType: string, data: string (base64) } | null
+async function callGemini(history, userText, imageData = null) {
+  const chat    = geminiModel.startChat({ history });
+  const timeout = imageData ? 25_000 : GEMINI_TIMEOUT_MS; // vision needs more time
+
+  const message = imageData
+    ? [{ text: userText }, { inlineData: imageData }]
+    : userText;
+
   return Promise.race([
-    chat.sendMessage(userText).then((r) => r.response.text()),
+    chat.sendMessage(message).then((r) => r.response.text()),
     new Promise((_, rej) =>
-      setTimeout(() => rej(new Error('Gemini timeout')), GEMINI_TIMEOUT_MS),
+      setTimeout(() => rej(new Error('Gemini timeout')), timeout),
     ),
   ]);
 }
 
-async function callGeminiWithRetry(history, userText, userId) {
+async function callGeminiWithRetry(history, userText, userId, imageData = null) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_GEMINI_RETRY; attempt++) {
     try {
-      const text = await callGemini(history, userText);
+      const text = await callGemini(history, userText, imageData);
       return { text, model: GEMINI_MODEL };
     } catch (err) {
       lastErr = err;
@@ -359,8 +366,9 @@ let _orExhaustedUntil = 0;
  * @param {string}      userId     - LINE userId
  * @param {string|null} forceModel - Forced model override
  * @param {object|null} routeInfo  - { skills, project } from router (optional)
+ * @param {object|null} imageData  - { mimeType, data (base64) } — vision input (optional)
  */
-async function generateReply(history, userText, userId, forceModel = null, routeInfo = null) {
+async function generateReply(history, userText, userId, forceModel = null, routeInfo = null, imageData = null) {
   const start    = Date.now();
   const tokenEst = Math.ceil((userText.length + 50) / 4);
 
@@ -394,6 +402,20 @@ async function generateReply(history, userText, userId, forceModel = null, route
     : [];
 
   const fullHistory = [...brainHistory, ...history];
+
+  // ── IMAGE / VISION — always use Gemini (OR free models don't support vision) ──
+  if (imageData) {
+    console.log('[AI] Vision mode — forcing Gemini');
+    try {
+      const result = await callGeminiWithRetry(fullHistory, userText, userId, imageData);
+      if (!result?.text?.trim()) throw new Error('empty vision response');
+      logger.info('Vision reply OK', { userId, latencyMs: Date.now() - start });
+      return result;
+    } catch (err) {
+      logger.warn('Vision call failed', { userId, err: err.message });
+      return { text: 'ขออภัยครับ ไม่สามารถวิเคราะห์รูปได้ตอนนี้ ลองส่งใหม่ครับ', model: 'gemini-error' };
+    }
+  }
 
   // ── FORCED GEMINI ────────────────────────────────────────────────────────────
   if (forceModel === 'gemini') {

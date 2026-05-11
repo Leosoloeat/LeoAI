@@ -75,6 +75,11 @@ const client = new messagingApi.MessagingApiClient({
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 });
 
+// Blob client for downloading image/audio/video content from LINE servers
+const blobClient = new messagingApi.MessagingApiBlobClient({
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+});
+
 // ── Session store ──────────────────────────────────────────────────────────────
 const sessions = new Map();
 
@@ -82,6 +87,69 @@ setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [k, v] of sessions) if (v.lastActive < cutoff) sessions.delete(k);
 }, 5 * 60_000).unref();
+
+// ── Image download ─────────────────────────────────────────────────────────────
+
+async function downloadLineImage(messageId) {
+  const response  = await blobClient.getMessageContent(messageId);
+  const mimeType  = response.headers?.get?.('content-type') || 'image/jpeg';
+  const buffer    = Buffer.from(await response.arrayBuffer());
+  return { mimeType, data: buffer.toString('base64') };
+}
+
+// ── Image event handler ────────────────────────────────────────────────────────
+
+async function handleImageEvent(event, userId) {
+  const rate = rateLimiter.check(userId);
+  if (!rate.ok) {
+    return safeReply(event.replyToken, [
+      rate.reason === 'pending' ? 'กำลังประมวลผลอยู่ครับ รอแป๊บนึง' : 'ส่งเร็วเกินไปครับ รอแป๊บนึงก่อน',
+    ]);
+  }
+
+  rateLimiter.start(userId);
+  const session   = getSession(userId);
+  session.lastActive = Date.now();
+  const forceModel   = userModelPrefs.get(userId) || null;
+
+  try {
+    const imageData = await downloadLineImage(event.message.id);
+    const imgPrompt = '[รูปภาพ] วิเคราะห์รูปนี้ตามประเภทของเนื้อหาที่เห็น';
+    const routeInfo = { skills: [], project: null, knowledgeScore: 5, isLowValue: false };
+
+    const { text: raw } = await generateReply(
+      session.history, imgPrompt, userId, forceModel, routeInfo, imageData,
+    );
+
+    if (!raw?.trim()) {
+      return safeReply(event.replyToken, ['ขออภัยครับ วิเคราะห์รูปไม่ได้ตอนนี้ ลองส่งใหม่ได้เลยครับ']);
+    }
+
+    const cleaned = sanitizeOutput(stripMarkdown(raw));
+
+    // Store only text in history (not the image bytes)
+    session.history.push(
+      { role: 'user',  parts: [{ text: imgPrompt }] },
+      { role: 'model', parts: [{ text: cleaned }] },
+    );
+    if (session.history.length > MAX_HISTORY_ENTRIES) {
+      session.history.splice(0, session.history.length - MAX_HISTORY_ENTRIES);
+    }
+
+    if (!shouldSkipCapture(routeInfo, cleaned) && getScriptUrl()) {
+      _captureKnowledge(userId, imgPrompt, cleaned, routeInfo)
+        .catch((e) => logger.error('KDE error (vision)', { err: e.message }));
+    }
+
+    logger.info('Vision reply sent', { userId, chars: cleaned.length });
+    return safeReply(event.replyToken, chunkForLine(cleaned));
+  } catch (err) {
+    logger.error('Image processing failed', { userId, err: err.message });
+    return safeReply(event.replyToken, ['ขออภัยครับ ไม่สามารถอ่านรูปได้ตอนนี้ครับ']);
+  } finally {
+    rateLimiter.done(userId);
+  }
+}
 
 // ── 3-tier knowledge capture ───────────────────────────────────────────────────
 
@@ -445,11 +513,17 @@ async function handleEvent(event) {
 
   if (event.type !== 'message') return null;
 
-  if (event.message.type !== 'text') {
-    return safeReply(event.replyToken, ['ตอนนี้รับเฉพาะข้อความตัวอักษรครับ พิมพ์เล่ามาได้เลย']);
+  const userId = event.source?.userId || 'anonymous';
+
+  // ── Image message → vision pipeline ─────────────────────────────────────────
+  if (event.message.type === 'image') {
+    return handleImageEvent(event, userId);
   }
 
-  const userId  = event.source?.userId || 'anonymous';
+  if (event.message.type !== 'text') {
+    return safeReply(event.replyToken, ['ตอนนี้รับเฉพาะข้อความและรูปภาพครับ']);
+  }
+
   const msgText = event.message.text.trim();
 
   // Handle slash commands first (bypass rate limiter — always fast)
