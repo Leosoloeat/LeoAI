@@ -1,58 +1,95 @@
 'use strict';
 
 // ── Skill triggers — keywords that activate each skill module ─────────────────
+
+// Business / clinic analysis skills
 const SKILL_TRIGGERS = {
-  coding: [
-    'code', 'bug', 'error', 'function', 'javascript', 'js', 'node', 'python',
-    'api', 'webhook', 'deploy', 'git', 'npm', 'script', 'debug', 'server',
-    'express', 'route', 'json', 'async', 'await', 'โค้ด', 'บัค', 'แก้ไข', 'เซิร์ฟเวอร์',
-    'railway', 'github', 'import', 'require', 'module', 'package', 'install',
+  analyze_clinic_ads: [
+    'cpm', 'cpc', 'ctr', 'roas', 'spend', 'ad spend', 'ad result', 'ad performance',
+    'โฆษณา', 'แคมเปญ', 'ผลโฆษณา', 'ยิงแอด', 'ค่าโฆษณา', 'reach', 'impression',
+    'facebook ads', 'meta ads', 'ad campaign', 'clinic ads', 'performance',
   ],
-  marketing: [
-    'marketing', 'content', 'viral', 'tiktok', 'facebook', 'ads', 'funnel',
-    'content hook', 'viral hook', 'ad copy', 'headline', 'creative', 'campaign',
-    'audience', 'targeting', 'conversion', 'lead gen', 'cta', 'โฆษณา', 'คอนเทนต์',
-    'ไวรัล', 'กลยุทธ์', 'ขาย', 'engagement', 'reach', 'impression', 'แคมเปญ',
+  analyze_funnel: [
+    'funnel', 'conversion rate', 'lead drop', 'drop-off', 'pipeline',
+    'booking rate', 'consultation rate', 'treatment rate', 'close rate',
+    'ฟันเนล', 'อัตราปิด', 'อัตราเปลี่ยน', 'lead', 'ลูกค้า เข้ามา', 'เข้ามา กี่คน',
+    'conversion', 'ปิดการขาย', 'นัด', 'เข้าคลินิก',
+  ],
+  analyze_line_oa: [
+    'line oa stats', 'line oa performance', 'friend count', 'broadcast rate',
+    'chat rate', 'block rate', 'oa analytics', 'line analytics', 'line report',
+    'ยอดเพื่อน', 'บล็อก', 'บรอดแคสต์', 'แชทเรต', 'line oa ผล', 'สถิติไลน์',
+  ],
+  analyze_competitor: [
+    'competitor', 'คู่แข่ง', 'เทียบ', 'เปรียบเทียบ', 'competitor price',
+    'competitor content', 'ราคาคู่แข่ง', 'positioning', 'differentiation',
+    'market position', 'กลยุทธ์คู่แข่ง', 'วิเคราะห์คู่แข่ง',
+  ],
+  financial_breakdown: [
+    'revenue', 'profit', 'margin', 'p&l', 'cost', 'รายได้', 'กำไร', 'ต้นทุน',
+    'gross margin', 'net profit', 'financial', 'ยอดขาย', 'ค่าใช้จ่าย', 'ผลประกอบการ',
+    'income', 'expense', 'break even', 'roi', 'cash flow', 'งบการเงิน',
+  ],
+  content_strategy: [
+    'content plan', 'posting schedule', 'what to post', 'content idea',
+    'engagement strategy', 'คอนเทนต์', 'ไวรัล', 'viral', 'tiktok', 'facebook',
+    'content hook', 'hook', 'สคริปต์', 'script', 'ไอเดียคอนเทนต์', 'แพลน',
+    'posting', '30 day', 'content calendar', 'โพสต์',
+  ],
+
+  // Technical skills — keep for bot/code queries
+  coding: [
+    'code', 'bug', 'error', 'function', 'javascript', 'node', 'python',
+    'api', 'webhook', 'deploy', 'git', 'npm', 'script', 'debug', 'server',
+    'express', 'json', 'async', 'โค้ด', 'บัค', 'เซิร์ฟเวอร์',
+    'railway', 'github', 'require', 'module', 'package', 'install',
   ],
   line_bot: [
-    'line', 'webhook', 'chatbot', 'oa', 'callback', 'channel', 'bot', 'reply',
-    'flex', 'liff', 'richmenu', 'push', 'broadcast', 'message api', 'ไลน์',
-    'บอท', 'แชทบอท', 'เว็บฮุค', 'token', 'line sdk', 'line channel',
+    'line bot', 'webhook', 'chatbot', 'line oa', 'callback', 'channel', 'flex',
+    'liff', 'richmenu', 'push message', 'broadcast', 'message api', 'ไลน์ บอท',
+    'บอท', 'แชทบอท', 'เว็บฮุค', 'line sdk', 'line channel', 'line api',
   ],
   ai_agent: [
     'agent', 'gemini', 'openai', 'claude', 'gpt', 'openrouter', 'llm',
-    'embedding', 'rag', 'vector', 'memory', 'context', 'inference', 'โมเดล',
-    'ระบบ ai', 'ai system', 'chatgpt', 'generative', 'langchain', 'autogen',
+    'embedding', 'rag', 'vector', 'inference', 'โมเดล', 'ระบบ ai', 'ai system',
+    'generative', 'langchain', 'autogen', 'kde', 'knowledge engine',
   ],
   prompt_engineering: [
-    'prompt', 'system prompt', 'instruction', 'template', 'few-shot', 'chain',
-    'reasoning', 'persona', 'role', 'พรอมต์', 'คำสั่ง', 'วิธีเขียน prompt',
-    'output format', 'zero-shot', 'context window',
+    'prompt', 'system prompt', 'instruction', 'few-shot', 'chain of thought',
+    'persona', 'พรอมต์', 'วิธีเขียน prompt', 'output format', 'zero-shot',
   ],
 };
 
 // ── Project detection — which project does this message belong to? ─────────────
 const PROJECT_TRIGGERS = {
+  clinic: [
+    'clinic', 'คลินิก', 'นวดหน้า', 'โบท็อกซ์', 'filler', 'ฟิลเลอร์', 'skin',
+    'สกิน', 'ทรีทเมนต์', 'treatment', 'booking', 'นัดหมาย', 'patient', 'คนไข้',
+  ],
   'line-oa': [
-    'line', 'webhook', 'bot', 'oa', 'chatbot', 'callback', 'liff', 'ไลน์', 'บอท',
-    'line oa', 'geminilinebot', 'channel access', 'line channel',
+    'line bot', 'webhook', 'line oa', 'chatbot', 'callback', 'liff', 'ไลน์ บอท',
+    'geminilinebot', 'channel access', 'line api',
   ],
   'leo-ai': [
     'leo ai', 'leoai', 'leo agency', 'ai agency', 'our system', 'this system',
-    'the system', 'ระบบของเรา', 'โปรเจคเรา',
+    'ระบบของเรา', 'โปรเจคเรา',
   ],
 };
 
 // ── Knowledge scoring — detect if a message contains valuable knowledge ────────
 const HIGH_VALUE_PATTERNS = [
-  { pattern: /step.?by.?step|ขั้นตอน|วิธีทำ|how to/i,         score: 2 },
-  { pattern: /fix|แก้|debug|solve|solution|แก้ไข|วิธีแก้/i,   score: 2 },
-  { pattern: /strategy|funnel|system|workflow|กลยุทธ์|ระบบ/i,  score: 2 },
-  { pattern: /deploy|setup|configure|install|ติดตั้ง|ตั้งค่า/i, score: 2 },
-  { pattern: /api|webhook|endpoint|integration|เชื่อมต่อ/i,   score: 2 },
-  { pattern: /prompt|template|script|แม่แบบ/i,                 score: 1 },
-  { pattern: /automation|automate|อัตโนมัติ/i,                  score: 1 },
-  { pattern: /\d+\.\s+\w+/,                                    score: 1 }, // numbered list
+  { pattern: /step.?by.?step|ขั้นตอน|วิธีทำ|how to/i,                score: 2 },
+  { pattern: /fix|แก้|debug|solve|solution|แก้ไข|วิธีแก้/i,          score: 2 },
+  { pattern: /strategy|funnel|system|workflow|กลยุทธ์|ระบบ/i,         score: 2 },
+  { pattern: /deploy|setup|configure|install|ติดตั้ง|ตั้งค่า/i,       score: 2 },
+  { pattern: /api|webhook|endpoint|integration|เชื่อมต่อ/i,           score: 2 },
+  { pattern: /cpm|cpc|roas|ctr|conversion rate|margin|revenue/i,       score: 2 }, // business metrics
+  { pattern: /funnel|pipeline|drop.?off|booking rate|close rate/i,     score: 2 }, // funnel analysis
+  { pattern: /competitor|positioning|differentiation|คู่แข่ง/i,        score: 2 }, // competitive
+  { pattern: /content plan|content strategy|posting schedule/i,         score: 1 },
+  { pattern: /prompt|template|script|แม่แบบ/i,                          score: 1 },
+  { pattern: /automation|automate|อัตโนมัติ/i,                           score: 1 },
+  { pattern: /\d+\.\s+\w+/,                                             score: 1 }, // numbered list
 ];
 
 const LOW_VALUE_PATTERNS = [
