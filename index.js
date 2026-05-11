@@ -37,7 +37,8 @@ const {
 const { route }                           = require('./src/router');
 const { listSkills }                      = require('./src/skillRetriever');
 const { listProjects }                    = require('./src/projectLoader');
-const { scoreKnowledge, buildKnowledgeEntry } = require('./src/knowledgeExtractor');
+const { scoreKnowledge, buildKnowledgeEntry, shouldSkipCapture, isHighConfidenceRegex } = require('./src/knowledgeExtractor');
+const { analyzeForKnowledge } = require('./src/kdeEngine');
 const rateLimiter = require('./src/rateLimiter');
 const logger      = require('./src/logger');
 
@@ -81,6 +82,30 @@ setInterval(() => {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [k, v] of sessions) if (v.lastActive < cutoff) sessions.delete(k);
 }, 5 * 60_000).unref();
+
+// ── 3-tier knowledge capture ───────────────────────────────────────────────────
+
+async function _captureKnowledge(userId, userText, aiText, routeInfo) {
+  const { score, type } = scoreKnowledge(userText, aiText, routeInfo.skills);
+
+  if (isHighConfidenceRegex(score, aiText)) {
+    const entry = buildKnowledgeEntry({
+      userId, userText, aiText,
+      skills:  routeInfo.skills,
+      project: routeInfo.project,
+      score, type,
+    });
+    logger.info('KDE fast-path', { score, type });
+    return saveKnowledge(entry);
+  }
+
+  const kdeEntry = await analyzeForKnowledge({ userId, userText, aiText, routeInfo });
+  if (kdeEntry) {
+    logger.info('KDE save', { type: kdeEntry.type, score: kdeEntry.score });
+    return saveKnowledge(kdeEntry);
+  }
+  logger.info('KDE skip', { userId, scoreRegex: score, len: aiText.length });
+}
 
 function getSession(userId) {
   let s = sessions.get(userId);
@@ -494,21 +519,9 @@ async function handleEvent(event) {
     }
 
     // ── Auto knowledge capture (non-blocking, fire-and-forget) ─────────────
-    const { score, type, shouldSave } = scoreKnowledge(msgText, cleaned, routeInfo.skills);
-    if (shouldSave && getScriptUrl()) {
-      const entry = buildKnowledgeEntry({
-        userId,
-        userText: msgText,
-        aiText:   cleaned,
-        skills:   routeInfo.skills,
-        project:  routeInfo.project,
-        score,
-        type,
-      });
-      // Fire and forget — never delay the reply
-      saveKnowledge(entry).catch((e) =>
-        logger.error('Auto knowledge save error', { err: e.message }),
-      );
+    if (!shouldSkipCapture(routeInfo, cleaned) && getScriptUrl()) {
+      _captureKnowledge(userId, msgText, cleaned, routeInfo)
+        .catch((e) => logger.error('KDE error', { err: e.message }));
     }
 
     return safeReply(event.replyToken, chunkForLine(cleaned));

@@ -84,4 +84,14 @@ function buildKnowledgeEntry({ userId, userText, aiText, skills, project, score,
   };
 }
 
-module.exports = { scoreKnowledge, buildKnowledgeEntry, SAVE_THRESHOLD };
+// Tier 1 gate — skip KDE entirely for low-value or trivial replies
+function shouldSkipCapture(routeInfo, aiText) {
+  return routeInfo.isLowValue || aiText.length < 80;
+}
+
+// Tier 2 fast-path — regex already highly confident, skip KDE call
+function isHighConfidenceRegex(score, aiText) {
+  return score >= 5 && /```[\s\S]+?```/.test(aiText);
+}
+
+module.exports = { scoreKnowledge, buildKnowledgeEntry, SAVE_THRESHOLD, shouldSkipCapture, isHighConfidenceRegex };
