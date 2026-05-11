@@ -91,10 +91,13 @@ setInterval(() => {
 // ── Image download ─────────────────────────────────────────────────────────────
 
 async function downloadLineImage(messageId) {
-  const response  = await blobClient.getMessageContent(messageId);
-  const mimeType  = response.headers?.get?.('content-type') || 'image/jpeg';
-  const buffer    = Buffer.from(await response.arrayBuffer());
-  return { mimeType, data: buffer.toString('base64') };
+  const stream = await blobClient.getMessageContent(messageId);
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const buffer = Buffer.concat(chunks);
+  return { mimeType: 'image/jpeg', data: buffer.toString('base64') };
 }
 
 // ── Image event handler ────────────────────────────────────────────────────────
