@@ -42,9 +42,24 @@ function loadContext() {
 }
 
 const SYSTEM_MESSAGE = loadContext();
+const LINE_MAX_CHARS = 4900; // LINE hard limit is 5000, keep buffer
 
 // In-memory conversation history per user (last 10 turns)
-const history = new Map();
+// Cleared when user sends /reset or session expires after 30 min idle
+const history    = new Map();
+const lastActive = new Map();
+const SESSION_TTL = 30 * 60_000;
+
+function pruneIdleSessions() {
+  const now = Date.now();
+  for (const [uid, ts] of lastActive) {
+    if (now - ts > SESSION_TTL) {
+      history.delete(uid);
+      lastActive.delete(uid);
+    }
+  }
+}
+setInterval(pruneIdleSessions, 5 * 60_000);
 
 function getHistory(userId) {
   if (!history.has(userId)) history.set(userId, []);
@@ -54,7 +69,18 @@ function getHistory(userId) {
 function pushHistory(userId, role, content) {
   const h = getHistory(userId);
   h.push({ role, content });
-  if (h.length > 20) h.splice(0, 2); // keep last 10 turns
+  if (h.length > 20) h.splice(0, 2);
+  lastActive.set(userId, Date.now());
+}
+
+function resetHistory(userId) {
+  history.delete(userId);
+  lastActive.delete(userId);
+}
+
+function truncate(text) {
+  if (text.length <= LINE_MAX_CHARS) return text;
+  return text.slice(0, LINE_MAX_CHARS - 20) + '\n\n[ข้อความถูกย่อ]';
 }
 
 function verifySignature(rawBody, signature) {
@@ -100,22 +126,43 @@ app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), async (req, res
   res.status(200).send('ok');
 
   for (const event of events) {
-    if (event.type !== 'message' || event.message?.type !== 'text') continue;
+    if (event.type !== 'message') continue;
 
-    const userId    = event.source?.userId || 'unknown';
-    const userText  = event.message.text || '';
+    const userId     = event.source?.userId || 'unknown';
     const replyToken = event.replyToken;
+    const msgType    = event.message?.type;
 
-    console.log(`[webhook] user=${userId} text="${userText}"`);
+    // Handle image messages
+    if (msgType === 'image') {
+      try {
+        await replyToLine(LINE_TOKEN, replyToken, 'ขออภัยครับ ตอนนี้รับได้เฉพาะข้อความ กรุณาพิมพ์คำถามได้เลยครับ 😊');
+      } catch {}
+      continue;
+    }
+
+    if (msgType !== 'text') continue;
+
+    const userText = event.message.text?.trim() || '';
+    console.log(`[webhook] user=${userId.slice(-6)} text="${userText.slice(0, 50)}"`);
+
+    // /reset command — clear conversation history
+    if (userText === '/reset') {
+      resetHistory(userId);
+      try {
+        await replyToLine(LINE_TOKEN, replyToken, 'รีเซ็ตการสนทนาแล้วครับ เริ่มใหม่ได้เลยครับ 😊');
+      } catch {}
+      continue;
+    }
 
     const userHistory = getHistory(userId);
 
     try {
-      const reply = await askClaude(SYSTEM_MESSAGE, userText, userHistory);
+      const raw   = await askClaude(SYSTEM_MESSAGE, userText, userHistory);
+      const reply = truncate(raw);
       pushHistory(userId, 'user',      userText);
-      pushHistory(userId, 'assistant', reply);
+      pushHistory(userId, 'assistant', raw);
       await replyToLine(LINE_TOKEN, replyToken, reply);
-      console.log(`[webhook] replied to ${userId}`);
+      console.log(`[webhook] replied to ${userId.slice(-6)}`);
     } catch (err) {
       console.error('[webhook] error:', err.message);
       try {
@@ -125,7 +172,12 @@ app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), async (req, res
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, t: Date.now() }));
+app.get('/health', (_req, res) => res.json({
+  ok:       true,
+  t:        Date.now(),
+  sessions: history.size,
+  model:    'claude-sonnet-4-6',
+}));
 
 app.listen(PORT, () => {
   console.log(`[LeoSP] listening on port ${PORT}`);
