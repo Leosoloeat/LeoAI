@@ -1,0 +1,135 @@
+'use strict';
+require('dotenv').config();
+
+const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { replyToLine } = require('./services/line');
+const { askClaude } = require('./services/claude');
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const LINE_SECRET = process.env.LINE_CHANNEL_SECRET || '';
+const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
+
+// Load all context at boot — not on every request
+function loadContext() {
+  const read = (relPath) => {
+    try {
+      return fs.readFileSync(path.join(__dirname, relPath), 'utf8');
+    } catch {
+      return '';
+    }
+  };
+
+  const masterPrompt  = read('prompts/LeoSP_master_prompt.md');
+  const knowledgeBase = read('context/notebooklm_export.md');
+  const sheetsSchema  = read('context/sheets_schema.md');
+  const userProfile   = read('context/user_profile.md');
+
+  return [
+    masterPrompt,
+    '---',
+    '## KNOWLEDGE BASE (ใช้ข้อมูลจากนี้เท่านั้น)',
+    knowledgeBase,
+    '---',
+    '## GOOGLE SHEETS SCHEMA',
+    sheetsSchema,
+    '---',
+    '## BRAND PROFILE',
+    userProfile,
+  ].join('\n\n');
+}
+
+const SYSTEM_MESSAGE = loadContext();
+
+// In-memory conversation history per user (last 10 turns)
+const history = new Map();
+
+function getHistory(userId) {
+  if (!history.has(userId)) history.set(userId, []);
+  return history.get(userId);
+}
+
+function pushHistory(userId, role, content) {
+  const h = getHistory(userId);
+  h.push({ role, content });
+  if (h.length > 20) h.splice(0, 2); // keep last 10 turns
+}
+
+function verifySignature(rawBody, signature) {
+  const hash = crypto
+    .createHmac('sha256', LINE_SECRET)
+    .update(rawBody)
+    .digest('base64');
+  return hash === signature;
+}
+
+const app = express();
+
+app.use((req, _res, next) => {
+  console.log(`[req] ${req.method} ${req.path}`);
+  next();
+});
+
+// Webhook — raw body required for signature verification
+app.post('/webhook', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
+  if (!LINE_SECRET || !LINE_TOKEN) {
+    console.error('[webhook] missing LINE env vars');
+    return res.status(200).send('not configured');
+  }
+
+  let body;
+  try {
+    body = JSON.parse(req.body.toString('utf8'));
+  } catch {
+    return res.status(400).send('bad json');
+  }
+
+  // LINE verify check sends empty events — return 200 immediately
+  const events = Array.isArray(body.events) ? body.events : [];
+  if (events.length === 0) return res.status(200).send('ok');
+
+  // Verify signature
+  const signature = req.get('x-line-signature') || '';
+  if (!verifySignature(req.body, signature)) {
+    console.warn('[webhook] invalid signature');
+    return res.status(401).send('invalid signature');
+  }
+
+  res.status(200).send('ok');
+
+  for (const event of events) {
+    if (event.type !== 'message' || event.message?.type !== 'text') continue;
+
+    const userId    = event.source?.userId || 'unknown';
+    const userText  = event.message.text || '';
+    const replyToken = event.replyToken;
+
+    console.log(`[webhook] user=${userId} text="${userText}"`);
+
+    const userHistory = getHistory(userId);
+
+    try {
+      const reply = await askClaude(SYSTEM_MESSAGE, userText, userHistory);
+      pushHistory(userId, 'user',      userText);
+      pushHistory(userId, 'assistant', reply);
+      await replyToLine(LINE_TOKEN, replyToken, reply);
+      console.log(`[webhook] replied to ${userId}`);
+    } catch (err) {
+      console.error('[webhook] error:', err.message);
+      try {
+        await replyToLine(LINE_TOKEN, replyToken, 'ขออภัยครับ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกสักครู่นะครับ');
+      } catch {}
+    }
+  }
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true, t: Date.now() }));
+
+app.listen(PORT, () => {
+  console.log(`[LeoSP] listening on port ${PORT}`);
+  console.log(`[LeoSP] webhook: POST /webhook`);
+  if (!LINE_SECRET || !LINE_TOKEN) console.warn('[LeoSP] WARNING: LINE credentials missing');
+  if (!process.env.ANTHROPIC_API_KEY) console.warn('[LeoSP] WARNING: ANTHROPIC_API_KEY missing');
+});
